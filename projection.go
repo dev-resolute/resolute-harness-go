@@ -86,6 +86,12 @@ func recordToMessage(rec Record) (pi.Message, bool, error) {
 			return pi.Message{}, false, err
 		}
 		return pi.NewText("user", p.Body), true, nil
+	case KindSignal:
+		var p SignalPayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return pi.Message{}, false, err
+		}
+		return signalToMessage(p), true, nil
 	case KindAssistantMessageCompleted:
 		var p AssistantMessageCompletedPayload
 		if err := rec.DecodePayload(&p); err != nil {

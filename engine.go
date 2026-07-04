@@ -518,7 +518,7 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	}
 	defer agent.Close()
 
-	if err := r.runPrompt(ctx, agent, r.sub.Input.Body); err != nil {
+	if err := r.runPrompt(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
 		return err
 	}
 	if len(r.sub.Input.ResultSchema) > 0 {
@@ -529,8 +529,8 @@ func (r *submissionRun) drive(ctx context.Context) error {
 
 // runPrompt runs one prompt on the agent and consumes its event stream into
 // canonical records.
-func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, body string) error {
-	stream, err := agent.Prompt(ctx, pi.NewText("user", body), pi.PromptOpts{
+func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
+	stream, err := agent.Prompt(ctx, msg, pi.PromptOpts{
 		SessionID: pi.SessionID(r.conv.ID),
 	})
 	if err != nil {
@@ -588,7 +588,7 @@ func (r *submissionRun) validateResultLoop(ctx context.Context, agent *pi.Agent)
 		if err := r.append(ctx, r.record(KindUserMessage, &UserMessagePayload{Body: corrective})); err != nil {
 			return err
 		}
-		if err := r.runPrompt(ctx, agent, corrective); err != nil {
+		if err := r.runPrompt(ctx, agent, pi.NewText("user", corrective)); err != nil {
 			return err
 		}
 	}
@@ -605,6 +605,15 @@ func (r *submissionRun) appendInputRecord(ctx context.Context) error {
 		if rec.SubmissionID == r.sub.ID && (rec.Kind == KindUserMessage || rec.Kind == KindSignal) {
 			return nil // a prior attempt already authored the input
 		}
+	}
+	if r.sub.Input.Kind == InboundSignal && r.sub.Input.Signal != nil {
+		rec := r.record(KindSignal, &SignalPayload{
+			Type:   r.sub.Input.Signal.Type,
+			Body:   r.sub.Input.Body,
+			Sender: r.sub.Input.Signal.Sender,
+			Tag:    r.sub.Input.Signal.Tag,
+		})
+		return r.append(ctx, rec)
 	}
 	rec := r.record(KindUserMessage, &UserMessagePayload{
 		Body:        r.sub.Input.Body,

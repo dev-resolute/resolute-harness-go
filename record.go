@@ -89,6 +89,17 @@ type UserMessagePayload struct {
 	Attachments []AttachmentRef `json:"attachments,omitempty"`
 }
 
+// SignalPayload is the payload of a signal record: one participant's
+// activity in a multi-party conversation the agent participates in
+// (ADR-0005). The sender attributes keep the participant distinguishable
+// from the agent's principal.
+type SignalPayload struct {
+	Type   string            `json:"type"`
+	Body   string            `json:"body"`
+	Sender map[string]string `json:"sender,omitempty"`
+	Tag    string            `json:"tag,omitempty"`
+}
+
 // AssistantMessageStartedPayload is the payload of an
 // assistant_message_started record, announcing an assistant message of the
 // given type from the given model.
@@ -193,6 +204,7 @@ func (*AssistantMessageStartedPayload) payloadKind() RecordKind {
 func (*TextDeltaPayload) payloadKind() RecordKind         { return KindAssistantTextDelta }
 func (*ThinkingDeltaPayload) payloadKind() RecordKind     { return KindAssistantThinkingDelta }
 func (*UserMessagePayload) payloadKind() RecordKind       { return KindUserMessage }
+func (*SignalPayload) payloadKind() RecordKind            { return KindSignal }
 func (*AssistantToolCallPayload) payloadKind() RecordKind { return KindAssistantToolCall }
 func (*ToolOutcomePayload) payloadKind() RecordKind       { return KindToolOutcome }
 func (*AssistantMessageCompletedPayload) payloadKind() RecordKind {
