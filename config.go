@@ -93,6 +93,12 @@ type Config struct {
 	// LeaseDuration bounds attempt ownership; heartbeats renew at a third of
 	// it. 0 means 30s.
 	LeaseDuration time.Duration
+	// DeltaFlushBytes flushes a pending delta batch once it reaches this
+	// size; 0 means 1024. Message boundaries always flush regardless.
+	DeltaFlushBytes int
+	// DeltaFlushInterval flushes a pending delta batch once its oldest
+	// fragment is this stale; 0 means 200ms.
+	DeltaFlushInterval time.Duration
 }
 
 func (c Config) validate() error {

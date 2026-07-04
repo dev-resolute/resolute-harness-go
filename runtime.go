@@ -28,8 +28,10 @@ type Runtime struct {
 	env    Env
 	logger *slog.Logger
 
-	claimInterval time.Duration
-	leaseDuration time.Duration
+	claimInterval      time.Duration
+	leaseDuration      time.Duration
+	deltaFlushBytes    int
+	deltaFlushInterval time.Duration
 
 	wake chan struct{} // nudges the coordinator claim loop
 
@@ -65,16 +67,26 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 	if leaseDuration <= 0 {
 		leaseDuration = defaultLeaseDuration
 	}
+	deltaFlushBytes := cfg.DeltaFlushBytes
+	if deltaFlushBytes <= 0 {
+		deltaFlushBytes = defaultDeltaFlushBytes
+	}
+	deltaFlushInterval := cfg.DeltaFlushInterval
+	if deltaFlushInterval <= 0 {
+		deltaFlushInterval = defaultDeltaFlushInterval
+	}
 	return &Runtime{
-		agents:        cfg.Agents,
-		store:         cfg.Store,
-		env:           env,
-		logger:        logger,
-		claimInterval: claimInterval,
-		leaseDuration: leaseDuration,
-		wake:          make(chan struct{}, 1),
-		appendSub:     make(chan struct{}),
-		settleSub:     make(chan struct{}),
+		agents:             cfg.Agents,
+		store:              cfg.Store,
+		env:                env,
+		logger:             logger,
+		claimInterval:      claimInterval,
+		leaseDuration:      leaseDuration,
+		deltaFlushBytes:    deltaFlushBytes,
+		deltaFlushInterval: deltaFlushInterval,
+		wake:               make(chan struct{}, 1),
+		appendSub:          make(chan struct{}),
+		settleSub:          make(chan struct{}),
 	}, nil
 }
 
@@ -257,6 +269,31 @@ func (rt *Runtime) Records(ctx context.Context, conversationID string, afterID s
 // are the app's concern; mount this wherever the app wants.
 func (rt *Runtime) Handler() http.Handler {
 	return newTransport(rt)
+}
+
+// appendWait returns a channel closed on the next record append — the live
+// tail's wake signal.
+func (rt *Runtime) appendWait() <-chan struct{} {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.appendSub
+}
+
+// sessionBusy reports whether the session has unsettled work — the live
+// tail stays open while it does.
+func (rt *Runtime) sessionBusy(ctx context.Context, key SessionKey) (bool, error) {
+	for _, status := range []SubmissionStatus{StatusQueued, StatusRunning, StatusTerminalizing} {
+		subs, err := rt.store.ListByStatus(ctx, status)
+		if err != nil {
+			return false, err
+		}
+		for _, sub := range subs {
+			if sub.SessionKey == key {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // notifyAppend wakes readers blocked on new records.

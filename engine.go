@@ -11,10 +11,14 @@ import (
 	pi "github.com/dev-resolute/resolute-agent-core-go"
 )
 
-// Engine timing defaults; Config.ClaimInterval/LeaseDuration override them.
+// Engine timing defaults; Config overrides them. The delta-flush defaults
+// are the measured pick for "few records, low latency" on the SQLite store
+// (architecture.md §12).
 const (
-	defaultClaimInterval = 250 * time.Millisecond
-	defaultLeaseDuration = 30 * time.Second
+	defaultClaimInterval      = 250 * time.Millisecond
+	defaultLeaseDuration      = 30 * time.Second
+	defaultDeltaFlushBytes    = 1024
+	defaultDeltaFlushInterval = 200 * time.Millisecond
 )
 
 // errLeaseLost cancels a run whose heartbeat discovered another attempt owns
@@ -409,6 +413,11 @@ type submissionRun struct {
 	mu     sync.Mutex
 	turnID string
 	halted bool
+
+	// Pending delta batch (accessed only from the event-consuming goroutine).
+	deltaKind    RecordKind
+	deltaBuf     []byte
+	deltaFirstAt time.Time
 }
 
 func (r *submissionRun) currentTurnID() string {
@@ -505,6 +514,9 @@ func (r *submissionRun) drive(ctx context.Context) error {
 			r.rt.logger.Error("author record from event", "submission", r.sub.ID, "error", err)
 		}
 	}
+	if err := r.flushDeltas(ctx); err != nil {
+		r.rt.logger.Error("flush trailing deltas", "submission", r.sub.ID, "error", err)
+	}
 	result := <-stream.Done
 	if result.Err != nil {
 		return fmt.Errorf("prompt: %w", result.Err)
@@ -540,13 +552,33 @@ func (r *submissionRun) appendInputRecord(ctx context.Context) error {
 	return r.append(ctx, rec)
 }
 
-// consumeEvent authors canonical records from one agent event. Delta
-// batching joins in the streaming slice (HARNESS-4).
+// consumeEvent authors canonical records from one agent event. Deltas are
+// batched (flush on size, staleness, and every message boundary); any
+// non-delta record flushes pending deltas first so the log stays ordered.
 func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) error {
 	switch e := ev.(type) {
+	case pi.TextDeltaEvent:
+		return r.bufferDelta(ctx, KindAssistantTextDelta, e.Delta)
+	case pi.ThinkingDeltaEvent:
+		return r.bufferDelta(ctx, KindAssistantThinkingDelta, e.Delta)
 	case pi.TurnStartEvent:
 		r.setTurnID(newULID())
+	case pi.MessageStartEvent:
+		if e.Role != "assistant" {
+			return nil
+		}
+		if err := r.flushDeltas(ctx); err != nil {
+			return err
+		}
+		rec := r.record(KindAssistantMessageStarted, &AssistantMessageStartedPayload{
+			Model:       r.cfg.Model,
+			MessageType: e.MessageType,
+		})
+		return r.append(ctx, rec)
 	case pi.ToolCallStartEvent:
+		if err := r.flushDeltas(ctx); err != nil {
+			return err
+		}
 		rec := r.record(KindAssistantToolCall, &AssistantToolCallPayload{
 			CallID:   e.CallID,
 			ToolName: e.ToolName,
@@ -554,6 +586,9 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		})
 		return r.append(ctx, rec)
 	case pi.ToolCallEndEvent:
+		if err := r.flushDeltas(ctx); err != nil {
+			return err
+		}
 		rec := r.record(KindToolOutcome, &ToolOutcomePayload{
 			CallID:   e.CallID,
 			ToolName: e.ToolName,
@@ -563,6 +598,10 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		})
 		return r.append(ctx, rec)
 	case pi.MessageEndEvent:
+		// Message end always flushes, even for non-assistant messages.
+		if err := r.flushDeltas(ctx); err != nil {
+			return err
+		}
 		if e.Message.Role != "assistant" {
 			return nil
 		}
@@ -572,4 +611,41 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		return r.append(ctx, rec)
 	}
 	return nil
+}
+
+// bufferDelta accumulates one streamed fragment, flushing on kind change,
+// size, or staleness.
+func (r *submissionRun) bufferDelta(ctx context.Context, kind RecordKind, delta string) error {
+	if len(r.deltaBuf) > 0 && r.deltaKind != kind {
+		if err := r.flushDeltas(ctx); err != nil {
+			return err
+		}
+	}
+	if len(r.deltaBuf) == 0 {
+		r.deltaKind = kind
+		r.deltaFirstAt = time.Now()
+	}
+	r.deltaBuf = append(r.deltaBuf, delta...)
+	if len(r.deltaBuf) >= r.rt.deltaFlushBytes || time.Since(r.deltaFirstAt) >= r.rt.deltaFlushInterval {
+		return r.flushDeltas(ctx)
+	}
+	return nil
+}
+
+// flushDeltas appends the pending delta batch, if any, as one record.
+func (r *submissionRun) flushDeltas(ctx context.Context) error {
+	if len(r.deltaBuf) == 0 {
+		return nil
+	}
+	text := string(r.deltaBuf)
+	kind := r.deltaKind
+	r.deltaBuf = r.deltaBuf[:0]
+
+	var rec Record
+	if kind == KindAssistantThinkingDelta {
+		rec = r.record(kind, &ThinkingDeltaPayload{Text: text})
+	} else {
+		rec = r.record(kind, &TextDeltaPayload{Text: text})
+	}
+	return r.append(ctx, rec)
 }

@@ -89,6 +89,26 @@ type UserMessagePayload struct {
 	Attachments []AttachmentRef `json:"attachments,omitempty"`
 }
 
+// AssistantMessageStartedPayload is the payload of an
+// assistant_message_started record, announcing an assistant message of the
+// given type from the given model.
+type AssistantMessageStartedPayload struct {
+	Model       string `json:"model"`
+	MessageType string `json:"messageType"`
+}
+
+// TextDeltaPayload is the payload of an assistant_text_delta record: one
+// batched fragment of streamed assistant text.
+type TextDeltaPayload struct {
+	Text string `json:"text"`
+}
+
+// ThinkingDeltaPayload is the payload of an assistant_thinking_delta record:
+// one batched fragment of streamed assistant thinking.
+type ThinkingDeltaPayload struct {
+	Text string `json:"text"`
+}
+
 // AssistantToolCallPayload is the payload of an assistant_tool_call record.
 type AssistantToolCallPayload struct {
 	CallID   string          `json:"callId"`
@@ -167,9 +187,14 @@ func (r Record) DecodePayload(dst interface{ payloadKind() RecordKind }) error {
 }
 
 func (*ConversationCreatedPayload) payloadKind() RecordKind { return KindConversationCreated }
-func (*UserMessagePayload) payloadKind() RecordKind         { return KindUserMessage }
-func (*AssistantToolCallPayload) payloadKind() RecordKind   { return KindAssistantToolCall }
-func (*ToolOutcomePayload) payloadKind() RecordKind         { return KindToolOutcome }
+func (*AssistantMessageStartedPayload) payloadKind() RecordKind {
+	return KindAssistantMessageStarted
+}
+func (*TextDeltaPayload) payloadKind() RecordKind         { return KindAssistantTextDelta }
+func (*ThinkingDeltaPayload) payloadKind() RecordKind     { return KindAssistantThinkingDelta }
+func (*UserMessagePayload) payloadKind() RecordKind       { return KindUserMessage }
+func (*AssistantToolCallPayload) payloadKind() RecordKind { return KindAssistantToolCall }
+func (*ToolOutcomePayload) payloadKind() RecordKind       { return KindToolOutcome }
 func (*AssistantMessageCompletedPayload) payloadKind() RecordKind {
 	return KindAssistantMessageCompleted
 }

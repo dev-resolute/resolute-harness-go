@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // transport is the HTTP surface of the Runtime (ADR-0004):
@@ -104,27 +105,47 @@ func (t *transport) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	afterID := r.Header.Get("Last-Event-ID")
-	recs, err := t.rt.Records(r.Context(), conv.ID, afterID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
-	for _, rec := range recs {
-		if err := writeSSE(w, rec); err != nil {
+
+	// Replay from the offset, then tail live appends until the session goes
+	// idle (no unsettled submissions) or the client disconnects. Reconnect,
+	// catch-up, and multi-reader all reduce to "replay the log from N".
+	ctx := r.Context()
+	afterID := r.Header.Get("Last-Event-ID")
+	for {
+		busy, err := t.rt.sessionBusy(ctx, key)
+		if err != nil {
 			return
 		}
+		wake := t.rt.appendWait()
+		recs, err := t.rt.Records(ctx, conv.ID, afterID)
+		if err != nil {
+			return
+		}
+		for _, rec := range recs {
+			if err := writeSSE(w, rec); err != nil {
+				return
+			}
+			afterID = rec.ID
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		if len(recs) == 0 && !busy {
+			return // caught up and idle: close cleanly
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-wake:
+		case <-time.After(250 * time.Millisecond):
+			// Fallback poll: appends may land via another process over the
+			// same store.
+		}
 	}
-	if flusher != nil {
-		flusher.Flush()
-	}
-	// Replay-only for the walking skeleton; the live tail joins in the
-	// streaming slice (HARNESS-4).
 }
 
 // writeSSE frames one record as an SSE event: id = record ID, event = kind,

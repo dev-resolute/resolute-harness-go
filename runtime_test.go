@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	pi "github.com/dev-resolute/resolute-agent-core-go"
 	llm "github.com/dev-resolute/resolute-llm-go"
 	"github.com/dev-resolute/resolute-llm-go/mock"
 
@@ -54,6 +55,38 @@ func forEachStore(t *testing.T, fn func(t *testing.T, store harness.Store)) {
 func newTestRuntime(t *testing.T, provider *mock.MockProvider) *harness.Runtime {
 	t.Helper()
 	return newTestRuntimeOn(t, provider, memory.New())
+}
+
+// newTestRuntimeWithTools is newTestRuntime with the weather tool registered.
+func newTestRuntimeWithTools(t *testing.T, provider llm.LLMProvider) *harness.Runtime {
+	t.Helper()
+	rt, err := harness.NewRuntime(harness.Config{
+		Agents: map[string]harness.AgentDefinition{
+			"support": {
+				Initialize: func(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
+					return harness.AgentRuntimeConfig{
+						Model:         "mock/test-model",
+						ContextWindow: 200_000,
+						Providers:     []llm.LLMProvider{provider},
+						Tools:         []pi.RegisteredTool{weatherTool()},
+					}, nil
+				},
+			},
+		},
+		Store: memory.New(),
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	if err := rt.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := rt.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return rt
 }
 
 // newTestRuntimeOn is newTestRuntime over an explicit store backend.
