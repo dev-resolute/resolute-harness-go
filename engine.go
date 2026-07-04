@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -78,8 +79,23 @@ func (c *coordinator) claimRunnable(ctx context.Context) {
 		})
 		if err != nil {
 			c.release(key)
-			if ctx.Err() == nil {
+			if ctx.Err() == nil && !errors.Is(err, ErrClaimLost) {
 				c.rt.logger.Error("claim submission", "submission", sub.ID, "error", err)
+			}
+			continue
+		}
+
+		// The attempt marker lands before any work so reconciliation can
+		// distinguish "started then died" from "never started".
+		if err := c.rt.store.StartAttempt(ctx, Attempt{
+			ID:           claimed.AttemptID,
+			SubmissionID: claimed.ID,
+			OwnerID:      c.ownerID,
+			StartedAt:    time.Now(),
+		}); err != nil {
+			c.release(key)
+			if ctx.Err() == nil {
+				c.rt.logger.Error("start attempt", "submission", claimed.ID, "error", err)
 			}
 			continue
 		}
@@ -150,9 +166,10 @@ func (c *coordinator) driveAttempt(ctx context.Context, sub Submission) error {
 	return run.drive(ctx)
 }
 
-// settle appends the submission_settled record and marks the submission
-// settled. Two-phase settlement semantics arrive with the durable engine
-// slice (HARNESS-3).
+// settle runs two-phase settlement: reserve the terminal transition, land
+// the submission_settled record exactly once, then finalize. A crash between
+// the phases is resolved by reconciliation re-running the record check and
+// finalize (HARNESS-3).
 func (c *coordinator) settle(ctx context.Context, sub Submission, payload SettledPayload) error {
 	// Use a fresh context bound to the store, not the (possibly cancelled)
 	// run context: settlement must land once the outcome is known.
@@ -160,6 +177,31 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
+	}
+	if err := c.rt.store.ReserveSettlement(ctx, sub.ID, sub.AttemptID); err != nil {
+		return fmt.Errorf("reserve settlement: %w", err)
+	}
+	if err := c.appendSettledRecordOnce(ctx, sub, payload); err != nil {
+		return err
+	}
+	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
+		return fmt.Errorf("finalize settlement: %w", err)
+	}
+	return nil
+}
+
+// appendSettledRecordOnce appends the submission_settled record unless one
+// already exists for the submission — the idempotency half of two-phase
+// settlement.
+func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) error {
+	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
+	if err != nil {
+		return fmt.Errorf("read records before settle: %w", err)
+	}
+	for _, rec := range recs {
+		if rec.Kind == KindSubmissionSettled && rec.SubmissionID == sub.ID {
+			return nil
+		}
 	}
 	rec := Record{
 		RecordEnvelope: RecordEnvelope{
@@ -176,9 +218,7 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 	if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
 		return fmt.Errorf("append settled record: %w", err)
 	}
-	if err := c.rt.store.SettleSubmission(ctx, sub.ID); err != nil {
-		return fmt.Errorf("mark submission settled: %w", err)
-	}
+	c.rt.notifyAppend()
 	return nil
 }
 

@@ -12,7 +12,6 @@ import (
 	"github.com/dev-resolute/resolute-llm-go/mock"
 
 	harness "github.com/dev-resolute/resolute-harness-go"
-	"github.com/dev-resolute/resolute-harness-go/memory"
 )
 
 // weatherTool is a deterministic tool for scripting multi-turn runs.
@@ -32,6 +31,10 @@ func weatherTool() pi.RegisteredTool {
 
 func TestMultiTurnToolConversationAndResume(t *testing.T) {
 	t.Parallel()
+	forEachStore(t, testMultiTurnToolConversationAndResume)
+}
+
+func testMultiTurnToolConversationAndResume(t *testing.T, store harness.Store) {
 	provider := mock.New("mock")
 	// Turn 1: the model requests the weather tool.
 	provider.OnPrompt(mock.LastUser("What's the weather in Berlin?")).
@@ -64,7 +67,7 @@ func TestMultiTurnToolConversationAndResume(t *testing.T) {
 				},
 			},
 		},
-		Store: memory.New(),
+		Store: store,
 	})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)

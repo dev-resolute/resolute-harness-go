@@ -2,6 +2,7 @@ package harness_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,12 +11,53 @@ import (
 
 	harness "github.com/dev-resolute/resolute-harness-go"
 	"github.com/dev-resolute/resolute-harness-go/memory"
+	"github.com/dev-resolute/resolute-harness-go/sqlite"
 )
+
+// storeFactories enumerates the in-tree backends; behavioral tests run
+// identically over each (ADR-0006: one contract, one tier).
+func storeFactories() map[string]func(t *testing.T) harness.Store {
+	return map[string]func(t *testing.T) harness.Store{
+		"memory": func(t *testing.T) harness.Store {
+			t.Helper()
+			return memory.New()
+		},
+		"sqlite": func(t *testing.T) harness.Store {
+			t.Helper()
+			s, err := sqlite.Open(filepath.Join(t.TempDir(), "harness.db"))
+			if err != nil {
+				t.Fatalf("sqlite.Open: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := s.Close(); err != nil {
+					t.Errorf("sqlite Close: %v", err)
+				}
+			})
+			return s
+		},
+	}
+}
+
+// forEachStore runs fn as a subtest per in-tree store backend.
+func forEachStore(t *testing.T, fn func(t *testing.T, store harness.Store)) {
+	for name, factory := range storeFactories() {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fn(t, factory(t))
+		})
+	}
+}
 
 // newTestRuntime builds a started Runtime with one "support" agent wired to
 // the given MockProvider over the memory store. Callers own the provider
 // script; cleanup stops the Runtime.
 func newTestRuntime(t *testing.T, provider *mock.MockProvider) *harness.Runtime {
+	t.Helper()
+	return newTestRuntimeOn(t, provider, memory.New())
+}
+
+// newTestRuntimeOn is newTestRuntime over an explicit store backend.
+func newTestRuntimeOn(t *testing.T, provider *mock.MockProvider, store harness.Store) *harness.Runtime {
 	t.Helper()
 	rt, err := harness.NewRuntime(harness.Config{
 		Agents: map[string]harness.AgentDefinition{
@@ -30,7 +72,7 @@ func newTestRuntime(t *testing.T, provider *mock.MockProvider) *harness.Runtime 
 				},
 			},
 		},
-		Store: memory.New(),
+		Store: store,
 	})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
@@ -72,9 +114,13 @@ func assertKindSubsequence(t *testing.T, recs []harness.Record, want []harness.R
 
 func TestDispatchPromptSettles(t *testing.T) {
 	t.Parallel()
+	forEachStore(t, testDispatchPromptSettles)
+}
+
+func testDispatchPromptSettles(t *testing.T, store harness.Store) {
 	provider := mock.New("mock")
 	provider.OnAny().RespondText("hello from the mock").Add()
-	rt := newTestRuntime(t, provider)
+	rt := newTestRuntimeOn(t, provider, store)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

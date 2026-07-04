@@ -6,9 +6,12 @@ package memory
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 
 	harness "github.com/dev-resolute/resolute-harness-go"
 )
@@ -21,7 +24,10 @@ type Store struct {
 	records   map[string][]harness.Record // conversation id → log
 
 	subs     map[string]harness.Submission
-	subOrder []string // admission order of submission ids
+	subOrder []string                     // admission order of submission ids
+	attempts map[string][]harness.Attempt // submission id → markers in start order
+
+	attachments map[string]harness.Attachment // digest → blob
 }
 
 var _ harness.Store = (*Store)(nil)
@@ -29,9 +35,11 @@ var _ harness.Store = (*Store)(nil)
 // New returns an empty in-memory store.
 func New() *Store {
 	return &Store{
-		convByKey: make(map[string]harness.Conversation),
-		records:   make(map[string][]harness.Record),
-		subs:      make(map[string]harness.Submission),
+		convByKey:   make(map[string]harness.Conversation),
+		records:     make(map[string][]harness.Record),
+		subs:        make(map[string]harness.Submission),
+		attempts:    make(map[string][]harness.Attempt),
+		attachments: make(map[string]harness.Attachment),
 	}
 }
 
@@ -156,14 +164,139 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	return sub, nil
 }
 
-func (s *Store) SettleSubmission(ctx context.Context, id string) error {
+func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatus) ([]harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sub, ok := s.subs[id]
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		if sub := s.subs[id]; sub.Status == status {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) StartAttempt(ctx context.Context, attempt harness.Attempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.subs[attempt.SubmissionID]; !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	s.attempts[attempt.SubmissionID] = append(s.attempts[attempt.SubmissionID], attempt)
+	return nil
+}
+
+func (s *Store) ListAttempts(ctx context.Context, submissionID string) ([]harness.Attempt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]harness.Attempt, len(s.attempts[submissionID]))
+	copy(out, s.attempts[submissionID])
+	return out, nil
+}
+
+func (s *Store) RenewLease(ctx context.Context, renewal harness.LeaseRenewal) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[renewal.SubmissionID]
 	if !ok {
 		return harness.ErrSubmissionNotFound
 	}
-	sub.Status = harness.StatusSettled
-	s.subs[id] = sub
+	if sub.Status != harness.StatusRunning || sub.AttemptID != renewal.AttemptID {
+		return harness.ErrClaimLost
+	}
+	sub.LeaseExpiresAt = renewal.LeaseExpiresAt
+	s.subs[sub.ID] = sub
 	return nil
+}
+
+func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness.Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		sub := s.subs[id]
+		if sub.Status == harness.StatusRunning && !sub.LeaseExpiresAt.After(now) {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusRunning || sub.AttemptID != attemptID {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusQueued
+	sub.OwnerID = ""
+	sub.AttemptID = ""
+	sub.LeaseExpiresAt = time.Time{}
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusRunning || sub.AttemptID != attemptID {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusTerminalizing
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+func (s *Store) FinalizeSettlement(ctx context.Context, submissionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	switch sub.Status {
+	case harness.StatusSettled:
+		return nil // idempotent: reconciliation may finalize again after a crash
+	case harness.StatusTerminalizing:
+		sub.Status = harness.StatusSettled
+		s.subs[sub.ID] = sub
+		return nil
+	default:
+		return harness.ErrClaimLost
+	}
+}
+
+func (s *Store) PutAttachment(ctx context.Context, mediaType string, data []byte) (harness.AttachmentRef, error) {
+	sum := sha256.Sum256(data)
+	ref := harness.AttachmentRef{
+		Digest:    "sha256:" + hex.EncodeToString(sum[:]),
+		MediaType: mediaType,
+		Size:      int64(len(data)),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.attachments[ref.Digest]; !ok {
+		stored := make([]byte, len(data))
+		copy(stored, data)
+		s.attachments[ref.Digest] = harness.Attachment{Ref: ref, Data: stored}
+	}
+	return ref, nil
+}
+
+func (s *Store) GetAttachment(ctx context.Context, digest string) (harness.Attachment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	att, ok := s.attachments[digest]
+	if !ok {
+		return harness.Attachment{}, harness.ErrAttachmentNotFound
+	}
+	return att, nil
 }
