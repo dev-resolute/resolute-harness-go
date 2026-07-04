@@ -23,6 +23,9 @@ var (
 	// no live run. Steering is live-only in v1 (ADR-0004); nothing is
 	// persisted.
 	ErrNoRunInFlight = errors.New("no run in flight for the session")
+	// ErrSessionBusy reports a Compact aimed at a session whose run is in
+	// flight; compaction is an idle-session operation.
+	ErrSessionBusy = errors.New("session has a run in flight")
 )
 
 // Runtime is the composed harness: agent definitions, store, coordinator,
@@ -279,6 +282,65 @@ func (rt *Runtime) Records(ctx context.Context, conversationID string, afterID s
 // are the app's concern; mount this wherever the app wants.
 func (rt *Runtime) Handler() http.Handler {
 	return newTransport(rt)
+}
+
+// CompactRequest addresses a session for the manual Compact operation.
+type CompactRequest struct {
+	Agent    string
+	Instance InstanceID
+	Session  string // empty means "default"
+}
+
+// Compact runs the manual compaction operation on an idle session: the
+// conversation is summarized via the agent's model and a compaction record
+// lands in the log; the reducer re-parents subsequent prompts onto it.
+func (rt *Runtime) Compact(ctx context.Context, req CompactRequest) error {
+	def, ok := rt.agents[req.Agent]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownAgent, req.Agent)
+	}
+	key := SessionKey{Agent: req.Agent, Instance: req.Instance, Session: req.Session}
+	if key.Session == "" {
+		key.Session = "default"
+	}
+	rt.liveMu.Lock()
+	_, busy := rt.liveRuns[key.String()]
+	rt.liveMu.Unlock()
+	if busy {
+		return fmt.Errorf("%w: %s", ErrSessionBusy, key)
+	}
+	conv, err := rt.store.GetConversation(ctx, key)
+	if err != nil {
+		return err
+	}
+	cfg, err := def.Initialize(ctx, key.Instance, rt.env)
+	if err != nil {
+		return fmt.Errorf("initialize agent %q: %w", req.Agent, err)
+	}
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	agent, err := pi.NewAgent(pi.AgentConfig{
+		Providers:        cfg.Providers,
+		DefaultModel:     cfg.Model,
+		SystemPrompt:     cfg.SystemPrompt,
+		ReserveTokens:    cfg.ReserveTokens,
+		KeepRecentTokens: cfg.KeepRecentTokens,
+		Session: &projection{
+			store:        rt.store,
+			conv:         conv,
+			systemPrompt: cfg.SystemPrompt,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("construct agent: %w", err)
+	}
+	defer agent.Close()
+	if _, err := agent.Compact(ctx, pi.CompactOpts{SessionID: pi.SessionID(conv.ID)}); err != nil {
+		return fmt.Errorf("compact %s: %w", key, err)
+	}
+	rt.notifyAppend()
+	return nil
 }
 
 // SteerRequest addresses a live run for Steer and FollowUp: the session key

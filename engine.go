@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pi "github.com/dev-resolute/resolute-agent-core-go"
+	llm "github.com/dev-resolute/resolute-llm-go"
 )
 
 // Engine timing defaults; Config overrides them. The delta-flush defaults
@@ -29,6 +30,17 @@ var errLeaseLost = errors.New("lease lost to another attempt")
 // errDeadlineHalted stops a run whose durability timeout passed mid-flight
 // (cooperative halt at a turn boundary).
 var errDeadlineHalted = errors.New("durability timeout reached mid-run")
+
+// overflowCompactRetries bounds the in-attempt overflow ladder: each
+// overflow triggers one compact-and-retry, at most this many times.
+const overflowCompactRetries = 2
+
+// transientRunError marks a model error worth a budgeted backoff retry (a
+// fresh attempt) instead of terminal failure.
+type transientRunError struct{ err error }
+
+func (e *transientRunError) Error() string { return "transient model error: " + e.err.Error() }
+func (e *transientRunError) Unwrap() error { return e.err }
 
 // coordinator runs the claim loop: it reconciles interrupted work, leases
 // runnable submissions, and drives their sessions. One per Runtime process
@@ -254,6 +266,7 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	<-heartbeatDone
 
 	var invalid *resultInvalidError
+	var transient *transientRunError
 	switch {
 	case errors.Is(context.Cause(runCtx), errLeaseLost):
 		// Another attempt owns the submission now; ours must not settle or
@@ -275,6 +288,21 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 			Error:     fmt.Sprintf("durability timeout exceeded mid-run (budget %s)", timeout),
 			ErrorCode: SettledErrTimeout,
 		}, logger)
+	case errors.As(runErr, &transient):
+		// Budgeted backoff retry: sleep, release, and let the claim path
+		// re-attempt. The consecutive-failure count is the durable
+		// AttemptCount, so a crash mid-backoff does not reset the budget.
+		backoff := transientBackoff(c.rt.claimInterval, sub.AttemptCount)
+		logger.Warn("transient model error; backing off before re-attempt", "error", runErr, "backoff", backoff, "attempt", sub.AttemptCount)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+		}
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := c.rt.store.ReleaseSubmission(releaseCtx, sub.ID, sub.AttemptID); err != nil && !errors.Is(err, ErrClaimLost) {
+			logger.Error("release after transient failure", "error", err)
+		}
 	case errors.As(runErr, &invalid):
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status: SettledFailed, Error: invalid.Error(), ErrorCode: SettledErrResultInvalid,
@@ -492,12 +520,14 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		turnID:       r.currentTurnID,
 	}
 	agent, err := pi.NewAgent(pi.AgentConfig{
-		Providers:    r.cfg.Providers,
-		DefaultModel: r.cfg.Model,
-		SystemPrompt: r.cfg.SystemPrompt,
-		Tools:        r.cfg.Tools,
-		Skills:       r.cfg.Skills,
-		Session:      proj,
+		Providers:        r.cfg.Providers,
+		DefaultModel:     r.cfg.Model,
+		SystemPrompt:     r.cfg.SystemPrompt,
+		Tools:            r.cfg.Tools,
+		Skills:           r.cfg.Skills,
+		ReserveTokens:    r.cfg.ReserveTokens,
+		KeepRecentTokens: r.cfg.KeepRecentTokens,
+		Session:          proj,
 		Hooks: pi.Hooks{
 			ShouldStopAfterTurn: func(hctx context.Context, c pi.AfterTurnCtx) bool {
 				if ctx.Err() != nil {
@@ -522,13 +552,61 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	r.rt.registerLiveRun(r.conv.Key, agent)
 	defer r.rt.unregisterLiveRun(r.conv.Key)
 
-	if err := r.runPrompt(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
+	if err := r.runRecovered(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
 		return err
 	}
 	if len(r.sub.Input.ResultSchema) > 0 {
 		return r.validateResultLoop(ctx, agent)
 	}
 	return nil
+}
+
+// runRecovered is the turn-recovery ladder around one prompt: context
+// overflow compacts and retries under a small budget; other stream errors
+// are classified fatal (llm.ErrProviderFatal) or transient (budgeted
+// backoff via a fresh attempt).
+func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
+	compactions := 0
+	for {
+		err := r.runPrompt(ctx, agent, msg)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, errDeadlineHalted) || ctx.Err() != nil {
+			return err
+		}
+		if errors.Is(llm.AsContextOverflow(err), llm.ErrContextOverflow) {
+			if compactions >= overflowCompactRetries {
+				return fmt.Errorf("context overflow persisted after %d compactions: %w", compactions, err)
+			}
+			compactions++
+			r.rt.logger.Info("context overflow; compacting and retrying the turn",
+				"submission", r.sub.ID, "compaction", compactions)
+			if _, cerr := agent.Compact(ctx, pi.CompactOpts{}); cerr != nil {
+				return fmt.Errorf("compact after overflow: %w", cerr)
+			}
+			r.rt.notifyAppend()
+			continue
+		}
+		if errors.Is(err, llm.ErrProviderFatal) {
+			return err
+		}
+		return &transientRunError{err: err}
+	}
+}
+
+// transientBackoff derives the retry delay from the durable attempt count:
+// base doubling per attempt, capped at 5s. The base tracks ClaimInterval so
+// tightened test engines back off proportionally.
+func transientBackoff(base time.Duration, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := base << (attempt - 1)
+	if d > 5*time.Second || d <= 0 {
+		return 5 * time.Second
+	}
+	return d
 }
 
 // runPrompt runs one prompt on the agent and consumes its event stream into

@@ -3,9 +3,10 @@ module github.com/dev-resolute/resolute-harness-go
 go 1.26.2
 
 require (
-	github.com/dev-resolute/resolute-agent-core-go v0.6.0
+	github.com/dev-resolute/resolute-agent-core-go v0.6.1
 	github.com/dev-resolute/resolute-llm-go v0.8.0
 	github.com/oklog/ulid/v2 v2.1.1
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	modernc.org/sqlite v1.53.0
 )
 
@@ -19,7 +20,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.23.0 // indirect

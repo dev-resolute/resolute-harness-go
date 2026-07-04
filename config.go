@@ -44,6 +44,10 @@ type AgentRuntimeConfig struct {
 	SystemPrompt  string
 	Tools         []pi.RegisteredTool
 	Skills        []pi.Skill
+	// ReserveTokens and KeepRecentTokens tune agent-core's compaction cut
+	// point; zero values use agent-core's defaults.
+	ReserveTokens    int
+	KeepRecentTokens int
 	// MaxAttempts is the durability budget on execution tries, recomputed
 	// from durable history on every claim; 0 means DefaultMaxAttempts.
 	MaxAttempts int

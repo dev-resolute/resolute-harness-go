@@ -110,6 +110,12 @@ func recordToMessage(rec Record) (pi.Message, bool, error) {
 			return pi.Message{}, false, err
 		}
 		return pi.NewToolResult("tool", p.CallID, p.ToolName, p.Content, p.Data, p.IsError), true, nil
+	case KindCompaction:
+		var p CompactionPayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return pi.Message{}, false, err
+		}
+		return pi.NewBranchSummaryMessage(p.Summary), true, nil
 	default:
 		return pi.Message{}, false, nil
 	}
@@ -119,7 +125,19 @@ func (p *projection) List(ctx context.Context) ([]pi.SessionMeta, error) {
 	return []pi.SessionMeta{{ID: pi.SessionID(p.conv.ID), CreatedAt: p.conv.CreatedAt}}, nil
 }
 
+// AppendBranchSummary lands the compaction record. The summary's EndIdx —
+// a message index into what Load returned to the compactor — is translated
+// into FirstKeptEntryID, the record-space re-parent point the reducer folds
+// into the tree.
 func (p *projection) AppendBranchSummary(ctx context.Context, id pi.SessionID, summary pi.BranchSummary) error {
+	recs, err := p.store.ReadRecords(ctx, string(id), "")
+	if err != nil {
+		return fmt.Errorf("read records before compaction: %w", err)
+	}
+	firstKept, err := p.firstKeptEntryID(recs, summary.EndIdx)
+	if err != nil {
+		return err
+	}
 	rec := Record{
 		RecordEnvelope: RecordEnvelope{
 			ID:             newULID(),
@@ -131,9 +149,10 @@ func (p *projection) AppendBranchSummary(ctx context.Context, id pi.SessionID, s
 			Time:           summary.CreatedAt,
 		},
 		Payload: mustPayload(&CompactionPayload{
-			Summary:  summary.Summary,
-			StartIdx: summary.StartIdx,
-			EndIdx:   summary.EndIdx,
+			Summary:          summary.Summary,
+			FirstKeptEntryID: firstKept,
+			StartIdx:         summary.StartIdx,
+			EndIdx:           summary.EndIdx,
 		}),
 	}
 	if p.turnID != nil {
@@ -145,28 +164,39 @@ func (p *projection) AppendBranchSummary(ctx context.Context, id pi.SessionID, s
 	return nil
 }
 
-func (p *projection) LoadBranchSummaries(ctx context.Context, id pi.SessionID) ([]pi.BranchSummary, error) {
-	recs, err := p.store.ReadRecords(ctx, string(id), "")
-	if err != nil {
-		return nil, fmt.Errorf("load summaries of %s: %w", id, err)
+// firstKeptEntryID finds the record whose message index equals endIdx —
+// the first message the compaction keeps — walking the active leaf path
+// with the same message numbering Load produces (the optional system
+// message occupies index 0).
+func (p *projection) firstKeptEntryID(recs []Record, endIdx int) (string, error) {
+	msgIdx := 0
+	if p.systemPrompt != "" {
+		msgIdx = 1
 	}
-	var out []pi.BranchSummary
 	for _, rec := range Reduce(recs).ActiveLeafPath() {
-		if rec.Kind != KindCompaction {
+		_, isMessage, err := recordToMessage(rec)
+		if err != nil {
+			return "", err
+		}
+		if !isMessage {
 			continue
 		}
-		var pl CompactionPayload
-		if err := rec.DecodePayload(&pl); err != nil {
-			return nil, err
+		if msgIdx == endIdx {
+			return rec.ID, nil
 		}
-		out = append(out, pi.BranchSummary{
-			StartIdx:  pl.StartIdx,
-			EndIdx:    pl.EndIdx,
-			Summary:   pl.Summary,
-			CreatedAt: rec.Time,
-		})
+		msgIdx++
 	}
-	return out, nil
+	// Everything was summarized; the reducer chains the summary as the leaf.
+	return "", nil
+}
+
+// LoadBranchSummaries deliberately returns nothing: compaction summaries
+// live INLINE on the re-parented active leaf path as branch_summary
+// messages (recordToMessage), so each Compact sees the already-compacted
+// view and summaries stay incremental. Serving them here too would double
+// count.
+func (p *projection) LoadBranchSummaries(ctx context.Context, id pi.SessionID) ([]pi.BranchSummary, error) {
+	return nil, nil
 }
 
 func (p *projection) Delete(ctx context.Context, id pi.SessionID) error {
