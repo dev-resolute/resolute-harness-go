@@ -250,20 +250,23 @@ func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness
 
 // ReleaseSubmission implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
-func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error {
+func (s *Store) ReleaseSubmission(ctx context.Context, release harness.SubmissionRelease) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sub, ok := s.subs[submissionID]
+	sub, ok := s.subs[release.SubmissionID]
 	if !ok {
 		return harness.ErrSubmissionNotFound
 	}
-	if sub.Status != harness.StatusRunning || sub.AttemptID != attemptID {
+	if sub.Status != harness.StatusRunning || sub.AttemptID != release.AttemptID {
 		return harness.ErrClaimLost
 	}
 	sub.Status = harness.StatusQueued
 	sub.OwnerID = ""
 	sub.AttemptID = ""
 	sub.LeaseExpiresAt = time.Time{}
+	if release.LastError != "" {
+		sub.LastError = release.LastError
+	}
 	s.subs[sub.ID] = sub
 	return nil
 }

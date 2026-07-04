@@ -43,5 +43,9 @@ type Submission struct {
 	AttemptID      string           `json:"attemptId,omitempty"`
 	OwnerID        string           `json:"ownerId,omitempty"`
 	LeaseExpiresAt time.Time        `json:"leaseExpiresAt,omitzero"`
-	CreatedAt      time.Time        `json:"createdAt"`
+	// LastError is the most recent run error recorded when an attempt was
+	// released for retry. It survives re-claims so a budget-exhaustion
+	// settlement can name the underlying failure (HARNESS-12).
+	LastError string    `json:"lastError,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
 }

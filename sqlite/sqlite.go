@@ -23,7 +23,7 @@ import (
 // schemaVersion is stamped into PRAGMA user_version on initialization and
 // checked on every open. Opening a database from a newer build fails with
 // harness.ErrUnsupportedSchema instead of corrupting it.
-const schemaVersion = 1
+const schemaVersion = 2
 
 const schema = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS submissions (
 	attempt_id       TEXT NOT NULL DEFAULT '',
 	owner_id         TEXT NOT NULL DEFAULT '',
 	lease_expires_ns INTEGER NOT NULL DEFAULT 0,
+	last_error       TEXT NOT NULL DEFAULT '',
 	created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_by_session ON submissions(session_key, seq);
@@ -112,6 +113,16 @@ func Open(path string) (*Store, error) {
 		if _, err := db.Exec(schema); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("initialize schema in %s: %w", path, err)
+		}
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("stamp schema version in %s: %w", path, err)
+		}
+	case 1:
+		// v1 -> v2: submissions gained last_error (HARNESS-12).
+		if _, err := db.Exec("ALTER TABLE submissions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("migrate schema v1->v2 in %s: %w", path, err)
 		}
 		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 			db.Close()
@@ -267,7 +278,7 @@ func (s *Store) AdmitSubmission(ctx context.Context, sub harness.Submission) (ha
 }
 
 const submissionColumns = `id, agent, instance, session, conversation_id, status,
-	input_json, attempt_count, attempt_id, owner_id, lease_expires_ns, created_at`
+	input_json, attempt_count, attempt_id, owner_id, lease_expires_ns, last_error, created_at`
 
 func scanSubmission(row interface{ Scan(...any) error }) (harness.Submission, error) {
 	var sub harness.Submission
@@ -276,7 +287,7 @@ func scanSubmission(row interface{ Scan(...any) error }) (harness.Submission, er
 	var createdAt string
 	err := row.Scan(&sub.ID, &sub.SessionKey.Agent, &sub.SessionKey.Instance, &sub.SessionKey.Session,
 		&sub.ConversationID, &sub.Status, &inputJSON, &sub.AttemptCount, &sub.AttemptID,
-		&sub.OwnerID, &leaseNS, &createdAt)
+		&sub.OwnerID, &leaseNS, &sub.LastError, &createdAt)
 	if err != nil {
 		return harness.Submission{}, err
 	}
@@ -466,15 +477,16 @@ func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness
 
 // ReleaseSubmission implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
-func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error {
+func (s *Store) ReleaseSubmission(ctx context.Context, release harness.SubmissionRelease) error {
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE submissions SET status = 'queued', attempt_id = '', owner_id = '', lease_expires_ns = 0
+		UPDATE submissions SET status = 'queued', attempt_id = '', owner_id = '', lease_expires_ns = 0,
+			last_error = CASE WHEN ? = '' THEN last_error ELSE ? END
 		WHERE id = ? AND status = 'running' AND attempt_id = ?`,
-		submissionID, attemptID)
+		release.LastError, release.LastError, release.SubmissionID, release.AttemptID)
 	if err != nil {
-		return fmt.Errorf("release %s: %w", submissionID, err)
+		return fmt.Errorf("release %s: %w", release.SubmissionID, err)
 	}
-	return casApplied(res, s.submissionExists(ctx, submissionID))
+	return casApplied(res, s.submissionExists(ctx, release.SubmissionID))
 }
 
 // ReserveSettlement implements the corresponding harness.Store method; semantics

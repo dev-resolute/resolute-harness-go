@@ -103,7 +103,7 @@ func recordToMessage(rec Record) (pi.Message, bool, error) {
 		if err := rec.DecodePayload(&p); err != nil {
 			return pi.Message{}, false, err
 		}
-		return pi.NewToolCall("assistant", p.CallID, p.ToolName, p.Args), true, nil
+		return pi.NewToolCallWithSignature("assistant", p.CallID, p.ToolName, p.Args, p.ThoughtSignature), true, nil
 	case KindToolOutcome:
 		var p ToolOutcomePayload
 		if err := rec.DecodePayload(&p); err != nil {

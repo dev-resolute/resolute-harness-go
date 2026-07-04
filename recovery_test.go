@@ -264,7 +264,7 @@ func TestTransientBudgetRecomputedFromHistory(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ClaimSubmission %d: %v", i, err)
 		}
-		if err := store.ReleaseSubmission(ctx, sub.ID, claimed.AttemptID); err != nil {
+		if err := store.ReleaseSubmission(ctx, harness.SubmissionRelease{SubmissionID: sub.ID, AttemptID: claimed.AttemptID}); err != nil {
 			t.Fatalf("ReleaseSubmission %d: %v", i, err)
 		}
 	}

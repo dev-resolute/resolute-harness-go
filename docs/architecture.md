@@ -74,11 +74,11 @@ v1 record kinds:
 | `signal` | type, body, sender attributes, optional tag (ADR-0005) |
 | `assistant_message_started` | model ref, turn correlation |
 | `assistant_text_delta` / `assistant_thinking_delta` | batched delta text |
-| `assistant_tool_call` | call id, tool name, args |
+| `assistant_tool_call` | call id, tool name, args, `thoughtSignature` (additive v0.1.1, HARNESS-11: Gemini 3's opaque per-call signature, replayed on turn recovery) |
 | `tool_outcome` | call id, `pi.ToolResult` (content, data, isError) |
 | `assistant_message_completed` | final `pi.Message` |
 | `compaction` | summary body, `firstKeptEntryID` (re-parent point) |
-| `submission_settled` | status, error, structured result if requested |
+| `submission_settled` | status, error (attempt-budget settlements append the last run error, HARNESS-12), structured result if requested |
 
 Attachments are stored out-of-line in the AttachmentStore, keyed by content digest; records carry only `AttachmentRef{Digest, MediaType, Size}` (ADR-0006). This is in the schema from day one even though v1 has no image ingestion path — the schema is the expensive thing to change.
 

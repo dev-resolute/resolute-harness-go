@@ -62,6 +62,17 @@ type LeaseRenewal struct {
 	LeaseExpiresAt time.Time
 }
 
+// SubmissionRelease carries the parameters of a release CAS: the owning
+// attempt giving the submission back to the queue, and optionally the run
+// error that caused it. A non-empty LastError overwrites the submission's
+// stored last error; empty preserves it (a shutdown or lease-reclaim release
+// is not a model failure and must not erase the real one).
+type SubmissionRelease struct {
+	SubmissionID string
+	AttemptID    string
+	LastError    string
+}
+
 // SubmissionStore is the durable submission half of the store contract.
 // Implementations must make AdmitSubmission idempotent by submission ID and
 // every state transition an atomic CAS on the expected prior state.
@@ -98,9 +109,10 @@ type SubmissionStore interface {
 	// before now.
 	ListExpiredLeases(ctx context.Context, now time.Time) ([]Submission, error)
 	// ReleaseSubmission moves the submission running→queued so a fresh
-	// attempt can claim it. It returns ErrClaimLost when the submission is
+	// attempt can claim it, recording release.LastError when non-empty (see
+	// SubmissionRelease). It returns ErrClaimLost when the submission is
 	// not running or is owned by a different attempt.
-	ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error
+	ReleaseSubmission(ctx context.Context, release SubmissionRelease) error
 	// ReserveSettlement atomically moves the submission
 	// running→terminalizing — phase one of settlement. It returns
 	// ErrClaimLost when the submission is not running or is owned by a

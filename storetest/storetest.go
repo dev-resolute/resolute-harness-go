@@ -301,11 +301,15 @@ func testReleaseSubmission(t *testing.T, s harness.Store) {
 	sub := claim(t, s, admit(t, s, "default"))
 
 	// A stale attempt cannot release.
-	if err := s.ReleaseSubmission(ctx, sub.ID, "stale-attempt"); !errors.Is(err, harness.ErrClaimLost) {
+	if err := s.ReleaseSubmission(ctx, harness.SubmissionRelease{SubmissionID: sub.ID, AttemptID: "stale-attempt"}); !errors.Is(err, harness.ErrClaimLost) {
 		t.Fatalf("stale release error = %v, want ErrClaimLost", err)
 	}
 
-	if err := s.ReleaseSubmission(ctx, sub.ID, sub.AttemptID); err != nil {
+	if err := s.ReleaseSubmission(ctx, harness.SubmissionRelease{
+		SubmissionID: sub.ID,
+		AttemptID:    sub.AttemptID,
+		LastError:    "model exploded",
+	}); err != nil {
 		t.Fatalf("ReleaseSubmission: %v", err)
 	}
 	got, err := s.GetSubmission(ctx, sub.ID)
@@ -315,11 +319,30 @@ func testReleaseSubmission(t *testing.T, s harness.Store) {
 	if got.Status != harness.StatusQueued {
 		t.Fatalf("released status = %q, want queued", got.Status)
 	}
+	if got.LastError != "model exploded" {
+		t.Fatalf("released LastError = %q, want %q", got.LastError, "model exploded")
+	}
 
 	// Released work is claimable again, with the attempt count preserved.
 	reclaimed := claim(t, s, got)
 	if reclaimed.AttemptCount != 2 {
 		t.Fatalf("reclaimed attempt count = %d, want 2", reclaimed.AttemptCount)
+	}
+	if reclaimed.LastError != "model exploded" {
+		t.Fatalf("reclaimed LastError = %q, want it preserved across the re-claim", reclaimed.LastError)
+	}
+
+	// An error-less release (shutdown, lease reclaim) preserves the stored
+	// last error instead of erasing it.
+	if err := s.ReleaseSubmission(ctx, harness.SubmissionRelease{SubmissionID: sub.ID, AttemptID: reclaimed.AttemptID}); err != nil {
+		t.Fatalf("ReleaseSubmission (no error): %v", err)
+	}
+	got, err = s.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.LastError != "model exploded" {
+		t.Fatalf("LastError after empty release = %q, want %q preserved", got.LastError, "model exploded")
 	}
 }
 

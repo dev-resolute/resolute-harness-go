@@ -121,10 +121,14 @@ type ThinkingDeltaPayload struct {
 }
 
 // AssistantToolCallPayload is the payload of an assistant_tool_call record.
+// ThoughtSignature is the provider's opaque per-call signature (Gemini 3);
+// turn recovery must replay it with the call or the provider rejects the
+// recovered turn (HARNESS-11). Additive: absent for providers without one.
 type AssistantToolCallPayload struct {
-	CallID   string          `json:"callId"`
-	ToolName string          `json:"toolName"`
-	Args     json.RawMessage `json:"args,omitempty"`
+	CallID           string          `json:"callId"`
+	ToolName         string          `json:"toolName"`
+	Args             json.RawMessage `json:"args,omitempty"`
+	ThoughtSignature []byte          `json:"thoughtSignature,omitempty"`
 }
 
 // ToolOutcomePayload is the payload of a tool_outcome record. It carries the

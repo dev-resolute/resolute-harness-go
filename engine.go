@@ -137,7 +137,7 @@ func (c *coordinator) reclaimExpired(ctx context.Context) {
 			// question.
 			continue
 		}
-		err := c.rt.store.ReleaseSubmission(ctx, sub.ID, sub.AttemptID)
+		err := c.rt.store.ReleaseSubmission(ctx, SubmissionRelease{SubmissionID: sub.ID, AttemptID: sub.AttemptID})
 		if err != nil && !errors.Is(err, ErrClaimLost) {
 			c.rt.logger.Error("release expired lease", "submission", sub.ID, "error", err)
 			continue
@@ -247,9 +247,13 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		timeout = DefaultSubmissionTimeout
 	}
 	if sub.AttemptCount > maxAttempts {
+		budgetErr := fmt.Sprintf("attempt budget exhausted: attempt %d exceeds max %d", sub.AttemptCount, maxAttempts)
+		if sub.LastError != "" {
+			budgetErr += "; last error: " + sub.LastError
+		}
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status:    SettledFailed,
-			Error:     fmt.Sprintf("attempt budget exhausted: attempt %d exceeds max %d", sub.AttemptCount, maxAttempts),
+			Error:     budgetErr,
 			ErrorCode: SettledErrAttemptBudget,
 		}, logger)
 		return
@@ -289,7 +293,7 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		// Runtime (or this store's next owner) re-attempts immediately.
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if err := c.rt.store.ReleaseSubmission(releaseCtx, sub.ID, sub.AttemptID); err != nil && !errors.Is(err, ErrClaimLost) {
+		if err := c.rt.store.ReleaseSubmission(releaseCtx, SubmissionRelease{SubmissionID: sub.ID, AttemptID: sub.AttemptID}); err != nil && !errors.Is(err, ErrClaimLost) {
 			logger.Error("release on shutdown", "error", err)
 		} else {
 			logger.Info("released in-flight submission on shutdown")
@@ -313,7 +317,11 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		}
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		if err := c.rt.store.ReleaseSubmission(releaseCtx, sub.ID, sub.AttemptID); err != nil && !errors.Is(err, ErrClaimLost) {
+		if err := c.rt.store.ReleaseSubmission(releaseCtx, SubmissionRelease{
+			SubmissionID: sub.ID,
+			AttemptID:    sub.AttemptID,
+			LastError:    runErr.Error(),
+		}); err != nil && !errors.Is(err, ErrClaimLost) {
 			logger.Error("release after transient failure", "error", err)
 		}
 	case errors.As(runErr, &invalid):
@@ -785,9 +793,10 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 			return err
 		}
 		rec := r.record(KindAssistantToolCall, &AssistantToolCallPayload{
-			CallID:   e.CallID,
-			ToolName: e.ToolName,
-			Args:     e.Args,
+			CallID:           e.CallID,
+			ToolName:         e.ToolName,
+			Args:             e.Args,
+			ThoughtSignature: e.ThoughtSignature,
 		})
 		return r.append(ctx, rec)
 	case pi.ToolCallEndEvent:
