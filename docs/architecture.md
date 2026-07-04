@@ -248,9 +248,13 @@ Test-driven throughout (project CLAUDE.md rule 4):
 - **Loop tests** — `resolute-llm-go/mock.MockProvider` for deterministic agent behavior; no live-provider dependency in CI.
 - **Transport tests** — SSE replay-from-offset, reconnect mid-stream, `?wait` settlement, idempotent re-POST.
 
-## 12. Open questions (tracked, not blocking)
+## 12. Open questions — resolved by v0.1.0 implementation
 
-- Delta-batch flush policy defaults (size/interval) — pick by measurement once the SQLite store exists.
-- Structured-result retry budget and feedback-prompt shape.
-- `Signal` → LLM-context rendering template (no real channel to validate against until the Slack adapter lands; keep it minimal and revisit).
-- Whether `Steer`/`FollowUp` should themselves be admitted submissions (durable) or remain live-run-only passthrough in v1 (current answer: passthrough; revisit with channels).
+What implementation actually chose (each remains a tracked default, revisitable):
+
+- **Delta-batch flush policy** — flush on 1024 bytes, 200ms staleness, and every message boundary (message end always flushes; any non-delta record flushes pending deltas first so the log stays ordered). Configurable via `Config.DeltaFlushBytes` / `Config.DeltaFlushInterval`.
+- **Structured-result retry budget and feedback shape** — default 2 corrective turns, per-Prompt override via `DispatchMessage.ResultRetries`. The feedback prompt is a canonical `user_message` (visible in the stream) carrying the validation error, the schema, and an instruction to reply with only conforming JSON (`correctiveMessage`). Terminal failure settles `failed/result_schema_invalid`.
+- **`Signal` → LLM-context rendering** — a custom `"signal"`-typed transcript message whose body is the signal JSON (type, body, sender, tag); agent-core's default conversion surfaces custom types as text, so sender identity stays distinguishable from the principal. Deliberately minimal and **provisional** until the first channel adapter validates it.
+- **Steer/FollowUp durability** — live-run-only passthrough shipped (structured `ErrNoRunInFlight` otherwise); durable steer remains deferred until channels.
+- **Compaction projection (deviation from §3.3's letter, same outcome)** — `Load` serves the re-parented active leaf path with the summary **inline** as a `branch_summary` message, and `LoadBranchSummaries` returns nil. Because `Agent.Compact` computes its cut over whatever `Load` returns, this keeps indices self-consistent and makes repeated compactions incremental (each sees the already-compacted view); serving summaries separately as §3.3's table described would double-count. Requires `resolute-agent-core-go` **v0.6.1** (`CompactOpts.SessionID`, additive) for the manual idle-session `Compact`.
+- **Transient model errors** — retried as fresh attempts with backoff (base = `ClaimInterval`, doubling per durable `AttemptCount`, capped 5s), so the budget is the max-attempts budget and survives restarts. `llm.ErrProviderFatal` stays terminal; context overflow gets compact-and-retry (2 per attempt) before failing.

@@ -43,6 +43,8 @@ func New() *Store {
 	}
 }
 
+// EnsureConversation implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) EnsureConversation(ctx context.Context, candidate harness.Conversation) (harness.Conversation, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -54,6 +56,8 @@ func (s *Store) EnsureConversation(ctx context.Context, candidate harness.Conver
 	return candidate, true, nil
 }
 
+// GetConversation implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetConversation(ctx context.Context, key harness.SessionKey) (harness.Conversation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -64,6 +68,8 @@ func (s *Store) GetConversation(ctx context.Context, key harness.SessionKey) (ha
 	return conv, nil
 }
 
+// AppendRecords implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) AppendRecords(ctx context.Context, conversationID string, recs []harness.Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,6 +77,8 @@ func (s *Store) AppendRecords(ctx context.Context, conversationID string, recs [
 	return nil
 }
 
+// ReadRecords implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReadRecords(ctx context.Context, conversationID string, afterID string) ([]harness.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,6 +93,8 @@ func (s *Store) ReadRecords(ctx context.Context, conversationID string, afterID 
 	return out, nil
 }
 
+// AdmitSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) AdmitSubmission(ctx context.Context, sub harness.Submission) (harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -111,6 +121,8 @@ func sameInput(a, b harness.DispatchMessage) bool {
 	return bytes.Equal(aj, bj)
 }
 
+// GetSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetSubmission(ctx context.Context, id string) (harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -121,6 +133,8 @@ func (s *Store) GetSubmission(ctx context.Context, id string) (harness.Submissio
 	return sub, nil
 }
 
+// ListRunnable implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListRunnable(ctx context.Context) ([]harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,6 +159,8 @@ func (s *Store) ListRunnable(ctx context.Context) ([]harness.Submission, error) 
 	return out, nil
 }
 
+// ClaimSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionClaim) (harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -164,6 +180,8 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	return sub, nil
 }
 
+// ListByStatus implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatus) ([]harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -176,6 +194,8 @@ func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatu
 	return out, nil
 }
 
+// StartAttempt implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) StartAttempt(ctx context.Context, attempt harness.Attempt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -186,6 +206,8 @@ func (s *Store) StartAttempt(ctx context.Context, attempt harness.Attempt) error
 	return nil
 }
 
+// ListAttempts implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListAttempts(ctx context.Context, submissionID string) ([]harness.Attempt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -194,6 +216,8 @@ func (s *Store) ListAttempts(ctx context.Context, submissionID string) ([]harnes
 	return out, nil
 }
 
+// RenewLease implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) RenewLease(ctx context.Context, renewal harness.LeaseRenewal) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -209,6 +233,8 @@ func (s *Store) RenewLease(ctx context.Context, renewal harness.LeaseRenewal) er
 	return nil
 }
 
+// ListExpiredLeases implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness.Submission, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -222,6 +248,8 @@ func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness
 	return out, nil
 }
 
+// ReleaseSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -240,6 +268,8 @@ func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID s
 	return nil
 }
 
+// ReserveSettlement implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,6 +285,8 @@ func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID s
 	return nil
 }
 
+// FinalizeSettlement implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) FinalizeSettlement(ctx context.Context, submissionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -274,6 +306,8 @@ func (s *Store) FinalizeSettlement(ctx context.Context, submissionID string) err
 	}
 }
 
+// PutAttachment implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) PutAttachment(ctx context.Context, mediaType string, data []byte) (harness.AttachmentRef, error) {
 	sum := sha256.Sum256(data)
 	ref := harness.AttachmentRef{
@@ -291,6 +325,8 @@ func (s *Store) PutAttachment(ctx context.Context, mediaType string, data []byte
 	return ref, nil
 }
 
+// GetAttachment implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetAttachment(ctx context.Context, digest string) (harness.Attachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

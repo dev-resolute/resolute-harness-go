@@ -132,6 +132,8 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// EnsureConversation implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) EnsureConversation(ctx context.Context, candidate harness.Conversation) (harness.Conversation, bool, error) {
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO conversations (key, id, agent, instance, session, created_at)
@@ -156,6 +158,8 @@ func (s *Store) EnsureConversation(ctx context.Context, candidate harness.Conver
 	return existing, false, nil
 }
 
+// GetConversation implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetConversation(ctx context.Context, key harness.SessionKey) (harness.Conversation, error) {
 	var conv harness.Conversation
 	var createdAt string
@@ -175,6 +179,8 @@ func (s *Store) GetConversation(ctx context.Context, key harness.SessionKey) (ha
 	return conv, nil
 }
 
+// AppendRecords implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) AppendRecords(ctx context.Context, conversationID string, recs []harness.Record) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -198,6 +204,8 @@ func (s *Store) AppendRecords(ctx context.Context, conversationID string, recs [
 	return nil
 }
 
+// ReadRecords implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReadRecords(ctx context.Context, conversationID string, afterID string) ([]harness.Record, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT json FROM records WHERE conversation_id = ? AND id > ? ORDER BY seq`,
@@ -221,6 +229,8 @@ func (s *Store) ReadRecords(ctx context.Context, conversationID string, afterID 
 	return out, rows.Err()
 }
 
+// AdmitSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) AdmitSubmission(ctx context.Context, sub harness.Submission) (harness.Submission, error) {
 	inputJSON, err := json.Marshal(sub.Input)
 	if err != nil {
@@ -283,6 +293,8 @@ func scanSubmission(row interface{ Scan(...any) error }) (harness.Submission, er
 	return sub, nil
 }
 
+// GetSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetSubmission(ctx context.Context, id string) (harness.Submission, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+submissionColumns+` FROM submissions WHERE id = ?`, id)
@@ -313,6 +325,8 @@ func (s *Store) querySubmissions(ctx context.Context, query string, args ...any)
 	return out, rows.Err()
 }
 
+// ListRunnable implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListRunnable(ctx context.Context) ([]harness.Submission, error) {
 	subs, err := s.querySubmissions(ctx, `
 		SELECT `+submissionColumns+` FROM submissions s
@@ -326,6 +340,8 @@ func (s *Store) ListRunnable(ctx context.Context) ([]harness.Submission, error) 
 	return subs, nil
 }
 
+// ListByStatus implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatus) ([]harness.Submission, error) {
 	subs, err := s.querySubmissions(ctx, `
 		SELECT `+submissionColumns+` FROM submissions WHERE status = ? ORDER BY seq`,
@@ -336,6 +352,8 @@ func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatu
 	return subs, nil
 }
 
+// ClaimSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionClaim) (harness.Submission, error) {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'running', attempt_id = ?, owner_id = ?,
@@ -378,6 +396,8 @@ func (s *Store) submissionExists(ctx context.Context, id string) error {
 	return nil
 }
 
+// StartAttempt implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) StartAttempt(ctx context.Context, attempt harness.Attempt) error {
 	if err := s.submissionExists(ctx, attempt.SubmissionID); err != nil {
 		return err
@@ -392,6 +412,8 @@ func (s *Store) StartAttempt(ctx context.Context, attempt harness.Attempt) error
 	return nil
 }
 
+// ListAttempts implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListAttempts(ctx context.Context, submissionID string) ([]harness.Attempt, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, submission_id, owner_id, started_at FROM attempts
@@ -416,6 +438,8 @@ func (s *Store) ListAttempts(ctx context.Context, submissionID string) ([]harnes
 	return out, rows.Err()
 }
 
+// RenewLease implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) RenewLease(ctx context.Context, renewal harness.LeaseRenewal) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET lease_expires_ns = ?
@@ -427,6 +451,8 @@ func (s *Store) RenewLease(ctx context.Context, renewal harness.LeaseRenewal) er
 	return casApplied(res, s.submissionExists(ctx, renewal.SubmissionID))
 }
 
+// ListExpiredLeases implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness.Submission, error) {
 	subs, err := s.querySubmissions(ctx, `
 		SELECT `+submissionColumns+` FROM submissions
@@ -438,6 +464,8 @@ func (s *Store) ListExpiredLeases(ctx context.Context, now time.Time) ([]harness
 	return subs, nil
 }
 
+// ReleaseSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'queued', attempt_id = '', owner_id = '', lease_expires_ns = 0
@@ -449,6 +477,8 @@ func (s *Store) ReleaseSubmission(ctx context.Context, submissionID, attemptID s
 	return casApplied(res, s.submissionExists(ctx, submissionID))
 }
 
+// ReserveSettlement implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'terminalizing'
@@ -460,6 +490,8 @@ func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID s
 	return casApplied(res, s.submissionExists(ctx, submissionID))
 }
 
+// FinalizeSettlement implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) FinalizeSettlement(ctx context.Context, submissionID string) error {
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'settled'
@@ -471,6 +503,8 @@ func (s *Store) FinalizeSettlement(ctx context.Context, submissionID string) err
 	return casApplied(res, s.submissionExists(ctx, submissionID))
 }
 
+// PutAttachment implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) PutAttachment(ctx context.Context, mediaType string, data []byte) (harness.AttachmentRef, error) {
 	sum := sha256.Sum256(data)
 	ref := harness.AttachmentRef{
@@ -488,6 +522,8 @@ func (s *Store) PutAttachment(ctx context.Context, mediaType string, data []byte
 	return ref, nil
 }
 
+// GetAttachment implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
 func (s *Store) GetAttachment(ctx context.Context, digest string) (harness.Attachment, error) {
 	var att harness.Attachment
 	err := s.db.QueryRowContext(ctx, `
