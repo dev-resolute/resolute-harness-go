@@ -103,6 +103,11 @@ type Config struct {
 	// DeltaFlushInterval flushes a pending delta batch once its oldest
 	// fragment is this stale; 0 means 200ms.
 	DeltaFlushInterval time.Duration
+	// Observers receive ephemeral HarnessEvents synchronously (ADR-0008).
+	Observers []Observer
+	// Interceptors wrap every operation boundary in registration order
+	// (first is outermost).
+	Interceptors []Interceptor
 }
 
 func (c Config) validate() error {

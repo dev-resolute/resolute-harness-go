@@ -41,6 +41,8 @@ type Runtime struct {
 	leaseDuration      time.Duration
 	deltaFlushBytes    int
 	deltaFlushInterval time.Duration
+	observers          []Observer
+	interceptors       []Interceptor
 
 	wake chan struct{} // nudges the coordinator claim loop
 
@@ -96,6 +98,8 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 		leaseDuration:      leaseDuration,
 		deltaFlushBytes:    deltaFlushBytes,
 		deltaFlushInterval: deltaFlushInterval,
+		observers:          cfg.Observers,
+		interceptors:       cfg.Interceptors,
 		wake:               make(chan struct{}, 1),
 		liveRuns:           make(map[string]*pi.Agent),
 		appendSub:          make(chan struct{}),
@@ -218,6 +222,11 @@ func (rt *Runtime) Dispatch(ctx context.Context, d Dispatch) (DispatchResult, er
 		return DispatchResult{}, fmt.Errorf("admit submission: %w", err)
 	}
 
+	rt.observe(SubmissionAdmittedEvent{
+		Correlation: Correlation{SessionKey: key, ConversationID: sub.ConversationID, SubmissionID: sub.ID},
+		Input:       sub.Input,
+	})
+
 	// Nudge the claim loop without blocking.
 	select {
 	case rt.wake <- struct{}{}:
@@ -336,11 +345,27 @@ func (rt *Runtime) Compact(ctx context.Context, req CompactRequest) error {
 		return fmt.Errorf("construct agent: %w", err)
 	}
 	defer agent.Close()
-	if _, err := agent.Compact(ctx, pi.CompactOpts{SessionID: pi.SessionID(conv.ID)}); err != nil {
+	corr := Correlation{SessionKey: key, ConversationID: conv.ID}
+	rt.observe(OperationStartedEvent{Correlation: corr, Operation: "compact"})
+	err = rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "compact", Correlation: corr}, func(c context.Context) error {
+		_, cerr := agent.Compact(c, pi.CompactOpts{SessionID: pi.SessionID(conv.ID)})
+		return cerr
+	})
+	rt.observe(OperationEndedEvent{Correlation: corr, Operation: "compact", Err: errString(err)})
+	if err != nil {
 		return fmt.Errorf("compact %s: %w", key, err)
 	}
+	rt.observe(CompactionEvent{Correlation: corr, Reason: "manual"})
 	rt.notifyAppend()
 	return nil
+}
+
+// errString renders an error for event fields; "" for nil.
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // SteerRequest addresses a live run for Steer and FollowUp: the session key

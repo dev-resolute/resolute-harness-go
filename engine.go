@@ -182,6 +182,12 @@ func (c *coordinator) claimRunnable(ctx context.Context) {
 			continue
 		}
 
+		c.rt.observe(SubmissionClaimedEvent{
+			Correlation:  claimed.correlation(),
+			OwnerID:      c.ownerID,
+			AttemptCount: claimed.AttemptCount,
+		})
+
 		// The attempt marker lands before any work so reconciliation can
 		// distinguish "started then died" from "never started".
 		if err := c.rt.store.StartAttempt(ctx, Attempt{
@@ -196,6 +202,7 @@ func (c *coordinator) claimRunnable(ctx context.Context) {
 			}
 			continue
 		}
+		c.rt.observe(AttemptStartedEvent{Correlation: claimed.correlation()})
 
 		c.rt.running.Add(1)
 		go func() {
@@ -261,7 +268,12 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	defer cancelRun(nil)
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
-	result, runErr := c.driveAttempt(runCtx, sub, cfg, deadline)
+	var result json.RawMessage
+	runErr := c.rt.intercept(runCtx, OpInfo{Kind: OpAttempt, Correlation: sub.correlation()}, func(cctx context.Context) error {
+		var derr error
+		result, derr = c.driveAttempt(cctx, sub, cfg, deadline)
+		return derr
+	})
 	cancelRun(nil)
 	<-heartbeatDone
 
@@ -294,6 +306,7 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		// AttemptCount, so a crash mid-backoff does not reset the budget.
 		backoff := transientBackoff(c.rt.claimInterval, sub.AttemptCount)
 		logger.Warn("transient model error; backing off before re-attempt", "error", runErr, "backoff", backoff, "attempt", sub.AttemptCount)
+		c.rt.observe(RecoveryEvent{Correlation: sub.correlation(), Decision: "transient_backoff", Detail: runErr.Error()})
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -360,6 +373,7 @@ func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, paylo
 		logger.Error("settle submission", "error", err)
 		return
 	}
+	c.rt.observe(SubmissionSettledEvent{Correlation: sub.correlation(), Payload: payload})
 	c.rt.notifySettled()
 }
 
@@ -478,6 +492,17 @@ func (r *submissionRun) setTurnID(id string) {
 	r.mu.Unlock()
 }
 
+// correlation snapshots this run's correlation ids for events and OpInfo.
+func (r *submissionRun) correlation() Correlation {
+	return Correlation{
+		SessionKey:     r.sub.SessionKey,
+		ConversationID: r.conv.ID,
+		SubmissionID:   r.sub.ID,
+		AttemptID:      r.sub.AttemptID,
+		TurnID:         r.currentTurnID(),
+	}
+}
+
 // record builds a canonical record stamped with this run's correlation ids.
 func (r *submissionRun) record(kind RecordKind, payload interface{ payloadKind() RecordKind }) Record {
 	return Record{
@@ -520,10 +545,10 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		turnID:       r.currentTurnID,
 	}
 	agent, err := pi.NewAgent(pi.AgentConfig{
-		Providers:        r.cfg.Providers,
+		Providers:        r.interceptedProviders(),
 		DefaultModel:     r.cfg.Model,
 		SystemPrompt:     r.cfg.SystemPrompt,
-		Tools:            r.cfg.Tools,
+		Tools:            r.interceptedTools(),
 		Skills:           r.cfg.Skills,
 		ReserveTokens:    r.cfg.ReserveTokens,
 		KeepRecentTokens: r.cfg.KeepRecentTokens,
@@ -582,9 +607,15 @@ func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, msg p
 			compactions++
 			r.rt.logger.Info("context overflow; compacting and retrying the turn",
 				"submission", r.sub.ID, "compaction", compactions)
-			if _, cerr := agent.Compact(ctx, pi.CompactOpts{}); cerr != nil {
+			r.rt.observe(RecoveryEvent{Correlation: r.correlation(), Decision: "overflow_compact_retry", Detail: err.Error()})
+			cerr := r.rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "compact", Correlation: r.correlation()}, func(c context.Context) error {
+				_, e := agent.Compact(c, pi.CompactOpts{})
+				return e
+			})
+			if cerr != nil {
 				return fmt.Errorf("compact after overflow: %w", cerr)
 			}
+			r.rt.observe(CompactionEvent{Correlation: r.correlation(), Reason: "overflow"})
 			r.rt.notifyAppend()
 			continue
 		}
@@ -609,9 +640,21 @@ func transientBackoff(base time.Duration, attempt int) time.Duration {
 	return d
 }
 
-// runPrompt runs one prompt on the agent and consumes its event stream into
-// canonical records.
+// runPrompt runs one prompt operation on the agent — wrapped in the
+// OpOperation interceptor boundary and bounded by operation events — and
+// consumes its event stream into canonical records.
 func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
+	corr := r.correlation()
+	r.rt.observe(OperationStartedEvent{Correlation: corr, Operation: "prompt"})
+	err := r.rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "prompt", Correlation: corr}, func(c context.Context) error {
+		return r.promptOnce(c, agent, msg)
+	})
+	r.rt.observe(OperationEndedEvent{Correlation: r.correlation(), Operation: "prompt", Err: errString(err)})
+	return err
+}
+
+// promptOnce is the unwrapped prompt body.
+func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
 	stream, err := agent.Prompt(ctx, msg, pi.PromptOpts{
 		SessionID: pi.SessionID(r.conv.ID),
 	})
@@ -710,11 +753,16 @@ func (r *submissionRun) appendInputRecord(ctx context.Context) error {
 func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) error {
 	switch e := ev.(type) {
 	case pi.TextDeltaEvent:
+		r.rt.observe(DeltaEvent{Correlation: r.correlation(), Kind: KindAssistantTextDelta, Text: e.Delta})
 		return r.bufferDelta(ctx, KindAssistantTextDelta, e.Delta)
 	case pi.ThinkingDeltaEvent:
+		r.rt.observe(DeltaEvent{Correlation: r.correlation(), Kind: KindAssistantThinkingDelta, Text: e.Delta})
 		return r.bufferDelta(ctx, KindAssistantThinkingDelta, e.Delta)
 	case pi.TurnStartEvent:
 		r.setTurnID(newULID())
+		r.rt.observe(TurnStartedEvent{Correlation: r.correlation(), Turn: e.Turn})
+	case pi.TurnEndEvent:
+		r.rt.observe(TurnEndedEvent{Correlation: r.correlation(), Turn: e.Turn})
 	case pi.SteerInjectedEvent:
 		return r.appendInjected(ctx, e.Message)
 	case pi.FollowUpInjectedEvent:
@@ -732,6 +780,7 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		})
 		return r.append(ctx, rec)
 	case pi.ToolCallStartEvent:
+		r.rt.observe(ToolCallStartedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.ToolName})
 		if err := r.flushDeltas(ctx); err != nil {
 			return err
 		}
@@ -742,6 +791,7 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		})
 		return r.append(ctx, rec)
 	case pi.ToolCallEndEvent:
+		r.rt.observe(ToolCallEndedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.ToolName, IsError: e.Result.IsError})
 		if err := r.flushDeltas(ctx); err != nil {
 			return err
 		}
@@ -819,4 +869,103 @@ func (r *submissionRun) flushDeltas(ctx context.Context) error {
 		rec = r.record(kind, &TextDeltaPayload{Text: text})
 	}
 	return r.append(ctx, rec)
+}
+
+// correlation snapshots a submission's correlation ids (no live turn).
+func (s Submission) correlation() Correlation {
+	return Correlation{
+		SessionKey:     s.SessionKey,
+		ConversationID: s.ConversationID,
+		SubmissionID:   s.ID,
+		AttemptID:      s.AttemptID,
+	}
+}
+
+// interceptedProviders wraps each configured provider so the OpTurn
+// interceptor boundary covers every model round-trip.
+func (r *submissionRun) interceptedProviders() []llm.LLMProvider {
+	if len(r.rt.interceptors) == 0 {
+		return r.cfg.Providers
+	}
+	out := make([]llm.LLMProvider, len(r.cfg.Providers))
+	for i, p := range r.cfg.Providers {
+		out[i] = &interceptedProvider{inner: p, run: r}
+	}
+	return out
+}
+
+// interceptedProvider wraps one provider's Stream call in the interceptor
+// chain: next covers the full model round-trip (events drained, result
+// delivered).
+type interceptedProvider struct {
+	inner llm.LLMProvider
+	run   *submissionRun
+}
+
+func (p *interceptedProvider) Name() string { return p.inner.Name() }
+
+func (p *interceptedProvider) Capabilities(model string) llm.ProviderCapabilities {
+	return p.inner.Capabilities(model)
+}
+
+func (p *interceptedProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.EventStream {
+	events := make(chan llm.LLMEvent, 16)
+	done := make(chan llm.StreamResult, 1)
+	go func() {
+		defer close(done)
+		delivered := false
+		err := p.run.rt.intercept(ctx, OpInfo{Kind: OpTurn, Correlation: p.run.correlation()}, func(c context.Context) error {
+			es := p.inner.Stream(c, req)
+			for ev := range es.Events {
+				events <- ev
+			}
+			res := <-es.Done
+			close(events)
+			delivered = true
+			done <- res
+			return res.Err
+		})
+		if !delivered {
+			// The chain aborted before (or instead of) running the model
+			// call; surface the abort as the stream outcome.
+			close(events)
+			done <- llm.StreamResult{Err: err}
+		}
+	}()
+	return llm.NewEventStream(events, done)
+}
+
+// interceptedTools wraps each registered tool so the OpTool interceptor
+// boundary covers every execution.
+func (r *submissionRun) interceptedTools() []pi.RegisteredTool {
+	if len(r.rt.interceptors) == 0 || len(r.cfg.Tools) == 0 {
+		return r.cfg.Tools
+	}
+	out := make([]pi.RegisteredTool, len(r.cfg.Tools))
+	for i, t := range r.cfg.Tools {
+		out[i] = &interceptedTool{inner: t, run: r}
+	}
+	return out
+}
+
+// interceptedTool wraps one tool's Execute in the interceptor chain.
+type interceptedTool struct {
+	inner pi.RegisteredTool
+	run   *submissionRun
+}
+
+func (t *interceptedTool) Name() string            { return t.inner.Name() }
+func (t *interceptedTool) Description() string     { return t.inner.Description() }
+func (t *interceptedTool) Schema() json.RawMessage { return t.inner.Schema() }
+func (t *interceptedTool) IsSequential() bool      { return t.inner.IsSequential() }
+
+func (t *interceptedTool) Execute(ctx context.Context, callID string, args json.RawMessage) (pi.ToolResult, error) {
+	op := OpInfo{Kind: OpTool, Correlation: t.run.correlation(), ToolName: t.inner.Name(), CallID: callID}
+	var result pi.ToolResult
+	err := t.run.rt.intercept(ctx, op, func(c context.Context) error {
+		var xerr error
+		result, xerr = t.inner.Execute(c, callID, args)
+		return xerr
+	})
+	return result, err
 }
