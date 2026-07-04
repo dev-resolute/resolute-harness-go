@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ func newTransport(rt *Runtime) *transport {
 	t := &transport{rt: rt, mux: http.NewServeMux()}
 	t.mux.HandleFunc("POST /agents/{name}/{id}", t.handleDispatch)
 	t.mux.HandleFunc("GET /agents/{name}/{id}", t.handleStream)
+	t.mux.HandleFunc("POST /agents/{name}/{id}/steer", t.handleInject(func(rt *Runtime) injectFn { return rt.Steer }))
+	t.mux.HandleFunc("POST /agents/{name}/{id}/followup", t.handleInject(func(rt *Runtime) injectFn { return rt.FollowUp }))
 	t.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -148,6 +151,44 @@ func (t *transport) handleStream(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(250 * time.Millisecond):
 			// Fallback poll: appends may land via another process over the
 			// same store.
+		}
+	}
+}
+
+// injectFn is the shared shape of Runtime.Steer and Runtime.FollowUp.
+type injectFn func(ctx context.Context, req SteerRequest) error
+
+// handleInject serves the steer and followup endpoints (ADR-0004: plain
+// POSTs routed to the live run).
+func (t *transport) handleInject(pick func(*Runtime) injectFn) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body    string `json:"body"`
+			Session string `json:"session,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode request body: %w", err))
+			return
+		}
+		if body.Body == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("%w: body is required", ErrInvalidDispatch))
+			return
+		}
+		err := pick(t.rt)(r.Context(), SteerRequest{
+			Agent:    r.PathValue("name"),
+			Instance: InstanceID(r.PathValue("id")),
+			Session:  body.Session,
+			Body:     body.Body,
+		})
+		switch {
+		case err == nil:
+			writeJSON(w, http.StatusOK, map[string]string{"status": "injected"})
+		case errors.Is(err, ErrUnknownAgent):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, ErrNoRunInFlight):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
 		}
 	}
 }

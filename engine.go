@@ -518,6 +518,10 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	}
 	defer agent.Close()
 
+	// Expose the run for Steer/FollowUp passthrough while it is in flight.
+	r.rt.registerLiveRun(r.conv.Key, agent)
+	defer r.rt.unregisterLiveRun(r.conv.Key)
+
 	if err := r.runPrompt(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
 		return err
 	}
@@ -633,6 +637,10 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		return r.bufferDelta(ctx, KindAssistantThinkingDelta, e.Delta)
 	case pi.TurnStartEvent:
 		r.setTurnID(newULID())
+	case pi.SteerInjectedEvent:
+		return r.appendInjected(ctx, e.Message)
+	case pi.FollowUpInjectedEvent:
+		return r.appendInjected(ctx, e.Message)
 	case pi.MessageStartEvent:
 		if e.Role != "assistant" {
 			return nil
@@ -686,6 +694,16 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		return r.append(ctx, rec)
 	}
 	return nil
+}
+
+// appendInjected authors the canonical record for a steered or followed-up
+// message, so readers see why the run changed course.
+func (r *submissionRun) appendInjected(ctx context.Context, msg pi.Message) error {
+	if err := r.flushDeltas(ctx); err != nil {
+		return err
+	}
+	rec := r.record(KindUserMessage, &UserMessagePayload{Body: msg.Text()})
+	return r.append(ctx, rec)
 }
 
 // bufferDelta accumulates one streamed fragment, flushing on kind change,

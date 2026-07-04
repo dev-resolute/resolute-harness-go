@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	pi "github.com/dev-resolute/resolute-agent-core-go"
 )
 
 // Runtime-level sentinel errors.
@@ -17,6 +19,10 @@ var (
 	ErrUnknownAgent = errors.New("unknown agent")
 	// ErrRuntimeClosed reports an operation on a closed Runtime.
 	ErrRuntimeClosed = errors.New("runtime is closed")
+	// ErrNoRunInFlight reports a steer or follow-up aimed at a session with
+	// no live run. Steering is live-only in v1 (ADR-0004); nothing is
+	// persisted.
+	ErrNoRunInFlight = errors.New("no run in flight for the session")
 )
 
 // Runtime is the composed harness: agent definitions, store, coordinator,
@@ -34,6 +40,9 @@ type Runtime struct {
 	deltaFlushInterval time.Duration
 
 	wake chan struct{} // nudges the coordinator claim loop
+
+	liveMu   sync.Mutex
+	liveRuns map[string]*pi.Agent // session key → in-flight agent
 
 	mu        sync.Mutex
 	started   bool
@@ -85,6 +94,7 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 		deltaFlushBytes:    deltaFlushBytes,
 		deltaFlushInterval: deltaFlushInterval,
 		wake:               make(chan struct{}, 1),
+		liveRuns:           make(map[string]*pi.Agent),
 		appendSub:          make(chan struct{}),
 		settleSub:          make(chan struct{}),
 	}, nil
@@ -269,6 +279,67 @@ func (rt *Runtime) Records(ctx context.Context, conversationID string, afterID s
 // are the app's concern; mount this wherever the app wants.
 func (rt *Runtime) Handler() http.Handler {
 	return newTransport(rt)
+}
+
+// SteerRequest addresses a live run for Steer and FollowUp: the session key
+// fields plus the message body.
+type SteerRequest struct {
+	Agent    string
+	Instance InstanceID
+	Session  string // empty means "default"
+	Body     string
+}
+
+// Steer injects a message into the session's in-flight run at agent-core's
+// next safe point (post-tool-batch). Live-only passthrough in v1: with no
+// run in flight it returns ErrNoRunInFlight and persists nothing.
+func (rt *Runtime) Steer(ctx context.Context, req SteerRequest) error {
+	agent, err := rt.liveRun(req)
+	if err != nil {
+		return err
+	}
+	return agent.Steer(ctx, pi.NewText("user", req.Body))
+}
+
+// FollowUp enqueues a message for after the in-flight prompt's current
+// exchange, producing the follow-up exchange within the same submission.
+// Live-only, like Steer.
+func (rt *Runtime) FollowUp(ctx context.Context, req SteerRequest) error {
+	agent, err := rt.liveRun(req)
+	if err != nil {
+		return err
+	}
+	return agent.FollowUp(ctx, pi.NewText("user", req.Body))
+}
+
+func (rt *Runtime) liveRun(req SteerRequest) (*pi.Agent, error) {
+	if _, ok := rt.agents[req.Agent]; !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, req.Agent)
+	}
+	key := SessionKey{Agent: req.Agent, Instance: req.Instance, Session: req.Session}
+	if key.Session == "" {
+		key.Session = "default"
+	}
+	rt.liveMu.Lock()
+	agent, ok := rt.liveRuns[key.String()]
+	rt.liveMu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNoRunInFlight, key)
+	}
+	return agent, nil
+}
+
+// registerLiveRun makes the session's in-flight agent steerable.
+func (rt *Runtime) registerLiveRun(key SessionKey, agent *pi.Agent) {
+	rt.liveMu.Lock()
+	rt.liveRuns[key.String()] = agent
+	rt.liveMu.Unlock()
+}
+
+func (rt *Runtime) unregisterLiveRun(key SessionKey) {
+	rt.liveMu.Lock()
+	delete(rt.liveRuns, key.String())
+	rt.liveMu.Unlock()
 }
 
 // appendWait returns a channel closed on the next record append — the live
