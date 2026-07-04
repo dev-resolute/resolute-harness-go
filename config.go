@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	pi "github.com/dev-resolute/resolute-agent-core-go"
 	llm "github.com/dev-resolute/resolute-llm-go"
@@ -43,7 +44,19 @@ type AgentRuntimeConfig struct {
 	SystemPrompt  string
 	Tools         []pi.RegisteredTool
 	Skills        []pi.Skill
+	// MaxAttempts is the durability budget on execution tries, recomputed
+	// from durable history on every claim; 0 means DefaultMaxAttempts.
+	MaxAttempts int
+	// SubmissionTimeout bounds a submission's total lifetime from admission;
+	// 0 means DefaultSubmissionTimeout.
+	SubmissionTimeout time.Duration
 }
+
+// Durability budget defaults (architecture.md §4.2 invariant 7).
+const (
+	DefaultMaxAttempts       = 10
+	DefaultSubmissionTimeout = time.Hour
+)
 
 func (c AgentRuntimeConfig) validate() error {
 	if c.Model == "" {
@@ -66,7 +79,7 @@ type AgentDefinition struct {
 }
 
 // Config carries everything NewRuntime needs: the named agent definitions,
-// the store, and optional environment and logging seams.
+// the store, and optional environment, logging, and engine-timing seams.
 type Config struct {
 	Agents map[string]AgentDefinition
 	Store  Store
@@ -74,6 +87,12 @@ type Config struct {
 	Env Env
 	// Logger receives engine diagnostics; nil means slog.Default().
 	Logger *slog.Logger
+	// ClaimInterval is the coordinator's poll cadence between wake nudges;
+	// 0 means 250ms.
+	ClaimInterval time.Duration
+	// LeaseDuration bounds attempt ownership; heartbeats renew at a third of
+	// it. 0 means 30s.
+	LeaseDuration time.Duration
 }
 
 func (c Config) validate() error {

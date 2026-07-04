@@ -4,21 +4,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	pi "github.com/dev-resolute/resolute-agent-core-go"
 )
 
-// Engine defaults for the walking skeleton. Full lease/heartbeat semantics
-// arrive in the durable-engine slice (HARNESS-3).
+// Engine timing defaults; Config.ClaimInterval/LeaseDuration override them.
 const (
 	defaultClaimInterval = 250 * time.Millisecond
 	defaultLeaseDuration = 30 * time.Second
 )
 
-// coordinator runs the claim loop: it leases runnable submissions and drives
-// their sessions. One per Runtime process (v1).
+// errLeaseLost cancels a run whose heartbeat discovered another attempt owns
+// the submission.
+var errLeaseLost = errors.New("lease lost to another attempt")
+
+// errDeadlineHalted stops a run whose durability timeout passed mid-flight
+// (cooperative halt at a turn boundary).
+var errDeadlineHalted = errors.New("durability timeout reached mid-run")
+
+// coordinator runs the claim loop: it reconciles interrupted work, leases
+// runnable submissions, and drives their sessions. One per Runtime process
+// (v1; multi-node is a store adapter concern, ADR-0010).
 type coordinator struct {
 	rt      *Runtime
 	ownerID string
@@ -35,18 +44,89 @@ func newCoordinator(rt *Runtime) *coordinator {
 	}
 }
 
-// loop claims and runs submissions until ctx is cancelled. It wakes on
-// admission nudges and on a steady tick.
+// loop reconciles once at startup, then claims and reclaims until ctx is
+// cancelled. It wakes on admission nudges and on a steady tick.
 func (c *coordinator) loop(ctx context.Context) {
-	ticker := time.NewTicker(defaultClaimInterval)
+	c.reconcile(ctx)
+	ticker := time.NewTicker(c.rt.claimInterval)
 	defer ticker.Stop()
 	for {
+		c.reclaimExpired(ctx)
 		c.claimRunnable(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-c.rt.wake:
 		case <-ticker.C:
+		}
+	}
+}
+
+// reconcile hands interrupted work to fresh attempts at startup: submissions
+// stuck terminalizing are finalized (their outcome record either exists or
+// is durably unknowable), and expired running leases are reclaimed by the
+// regular loop.
+func (c *coordinator) reconcile(ctx context.Context) {
+	stuck, err := c.rt.store.ListByStatus(ctx, StatusTerminalizing)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("reconcile: list terminalizing", "error", err)
+		}
+		return
+	}
+	for _, sub := range stuck {
+		if err := c.finalizeInterrupted(ctx, sub); err != nil {
+			c.rt.logger.Error("reconcile terminalizing submission", "submission", sub.ID, "error", err)
+		}
+	}
+}
+
+// finalizeInterrupted completes settlement for a submission that crashed
+// between the two phases. If the terminal record landed before the crash it
+// is honored; otherwise the outcome is unknowable and the submission settles
+// failed with the indeterminate code.
+func (c *coordinator) finalizeInterrupted(ctx context.Context, sub Submission) error {
+	if err := c.appendSettledRecordOnce(ctx, sub, SettledPayload{
+		Status:    SettledFailed,
+		Error:     "process crashed during settlement; run outcome unknown",
+		ErrorCode: SettledErrIndeterminate,
+	}); err != nil {
+		return err
+	}
+	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
+		return fmt.Errorf("finalize settlement: %w", err)
+	}
+	c.rt.notifySettled()
+	return nil
+}
+
+// reclaimExpired releases running submissions whose lease expired — a
+// crashed or wedged owner — so the normal claim path re-attempts them.
+func (c *coordinator) reclaimExpired(ctx context.Context) {
+	expired, err := c.rt.store.ListExpiredLeases(ctx, time.Now())
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("list expired leases", "error", err)
+		}
+		return
+	}
+	for _, sub := range expired {
+		key := sub.SessionKey.String()
+		c.mu.Lock()
+		ownLive := c.active[key]
+		c.mu.Unlock()
+		if ownLive {
+			// Our own run holds the session; its heartbeat owns the lease
+			// question.
+			continue
+		}
+		err := c.rt.store.ReleaseSubmission(ctx, sub.ID, sub.AttemptID)
+		if err != nil && !errors.Is(err, ErrClaimLost) {
+			c.rt.logger.Error("release expired lease", "submission", sub.ID, "error", err)
+			continue
+		}
+		if err == nil {
+			c.rt.logger.Info("reclaimed expired lease", "submission", sub.ID, "deadOwner", sub.OwnerID)
 		}
 	}
 }
@@ -75,7 +155,7 @@ func (c *coordinator) claimRunnable(ctx context.Context) {
 			SubmissionID:   sub.ID,
 			AttemptID:      newULID(),
 			OwnerID:        c.ownerID,
-			LeaseExpiresAt: time.Now().Add(defaultLeaseDuration),
+			LeaseExpiresAt: time.Now().Add(c.rt.leaseDuration),
 		})
 		if err != nil {
 			c.release(key)
@@ -116,25 +196,129 @@ func (c *coordinator) release(sessionKey string) {
 }
 
 // runSubmission drives one claimed submission through one attempt:
-// materialize the agent, author the input record, run the prompt while
-// authoring canonical records from its event stream, then settle.
+// budgets, heartbeat, agent run, settlement or release.
 func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	logger := c.rt.logger.With("submission", sub.ID, "session", sub.SessionKey.String(), "attempt", sub.AttemptID)
 
-	err := c.driveAttempt(ctx, sub)
-	if ctx.Err() != nil && err != nil {
-		// Shutdown interrupted the attempt: leave the submission running for
-		// reconciliation (HARNESS-3) rather than settling a false failure.
-		logger.Info("attempt interrupted by shutdown", "error", err)
+	def := c.rt.agents[sub.SessionKey.Agent]
+	cfg, err := def.Initialize(ctx, sub.SessionKey.Instance, c.rt.env)
+	if err == nil {
+		err = cfg.validate()
+	}
+	if err != nil {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status: SettledFailed, Error: err.Error(), ErrorCode: SettledErrRunFailed,
+		}, logger)
 		return
 	}
 
-	settledPayload := SettledPayload{Status: SettledSucceeded}
-	if err != nil {
-		logger.Error("attempt failed", "error", err)
-		settledPayload = SettledPayload{Status: SettledFailed, Error: err.Error()}
+	// Durability budgets are evaluated from durable state on every attempt,
+	// so a crash-restart loop exhausts them instead of retrying forever.
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = DefaultMaxAttempts
 	}
-	if err := c.settle(ctx, sub, settledPayload); err != nil {
+	timeout := cfg.SubmissionTimeout
+	if timeout <= 0 {
+		timeout = DefaultSubmissionTimeout
+	}
+	if sub.AttemptCount > maxAttempts {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     fmt.Sprintf("attempt budget exhausted: attempt %d exceeds max %d", sub.AttemptCount, maxAttempts),
+			ErrorCode: SettledErrAttemptBudget,
+		}, logger)
+		return
+	}
+	deadline := sub.CreatedAt.Add(timeout)
+	if time.Now().After(deadline) {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     fmt.Sprintf("durability timeout exceeded: admitted %s ago (budget %s)", time.Since(sub.CreatedAt).Round(time.Second), timeout),
+			ErrorCode: SettledErrTimeout,
+		}, logger)
+		return
+	}
+
+	runCtx, cancelRun := context.WithCancelCause(ctx)
+	defer cancelRun(nil)
+	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
+
+	runErr := c.driveAttempt(runCtx, sub, cfg, deadline)
+	cancelRun(nil)
+	<-heartbeatDone
+
+	switch {
+	case errors.Is(context.Cause(runCtx), errLeaseLost):
+		// Another attempt owns the submission now; ours must not settle or
+		// release.
+		logger.Warn("lease lost mid-run; abandoning attempt")
+	case runErr != nil && ctx.Err() != nil:
+		// Shutdown interrupted the attempt: release the claim so a fresh
+		// Runtime (or this store's next owner) re-attempts immediately.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := c.rt.store.ReleaseSubmission(releaseCtx, sub.ID, sub.AttemptID); err != nil && !errors.Is(err, ErrClaimLost) {
+			logger.Error("release on shutdown", "error", err)
+		} else {
+			logger.Info("released in-flight submission on shutdown")
+		}
+	case errors.Is(runErr, errDeadlineHalted):
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     fmt.Sprintf("durability timeout exceeded mid-run (budget %s)", timeout),
+			ErrorCode: SettledErrTimeout,
+		}, logger)
+	case runErr != nil:
+		logger.Error("attempt failed", "error", runErr)
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status: SettledFailed, Error: runErr.Error(), ErrorCode: SettledErrRunFailed,
+		}, logger)
+	default:
+		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded}, logger)
+	}
+}
+
+// startHeartbeat renews the lease at a third of its duration until the run
+// context ends. Discovering a lost lease cancels the run with errLeaseLost.
+func (c *coordinator) startHeartbeat(runCtx context.Context, sub Submission, cancelRun context.CancelCauseFunc, logger *slog.Logger) <-chan struct{} {
+	done := make(chan struct{})
+	interval := c.rt.leaseDuration / 3
+	if interval <= 0 {
+		interval = defaultLeaseDuration / 3
+	}
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			err := c.rt.store.RenewLease(runCtx, LeaseRenewal{
+				SubmissionID:   sub.ID,
+				AttemptID:      sub.AttemptID,
+				LeaseExpiresAt: time.Now().Add(c.rt.leaseDuration),
+			})
+			switch {
+			case err == nil:
+			case errors.Is(err, ErrClaimLost):
+				cancelRun(errLeaseLost)
+				return
+			case runCtx.Err() != nil:
+				return
+			default:
+				logger.Error("renew lease", "error", err)
+			}
+		}
+	}()
+	return done
+}
+
+func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, payload SettledPayload, logger *slog.Logger) {
+	if err := c.settle(ctx, sub, payload); err != nil {
 		logger.Error("settle submission", "error", err)
 		return
 	}
@@ -142,34 +326,24 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 }
 
 // driveAttempt runs the agent for one attempt and returns the run error.
-func (c *coordinator) driveAttempt(ctx context.Context, sub Submission) error {
-	def := c.rt.agents[sub.SessionKey.Agent]
-	cfg, err := def.Initialize(ctx, sub.SessionKey.Instance, c.rt.env)
-	if err != nil {
-		return fmt.Errorf("initialize agent %q: %w", sub.SessionKey.Agent, err)
-	}
-	if err := cfg.validate(); err != nil {
-		return err
-	}
-
+func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) error {
 	conv, err := c.rt.store.GetConversation(ctx, sub.SessionKey)
 	if err != nil {
 		return fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
 	}
-
 	run := &submissionRun{
-		rt:   c.rt,
-		sub:  sub,
-		conv: conv,
-		cfg:  cfg,
+		rt:       c.rt,
+		sub:      sub,
+		conv:     conv,
+		cfg:      cfg,
+		deadline: deadline,
 	}
 	return run.drive(ctx)
 }
 
 // settle runs two-phase settlement: reserve the terminal transition, land
 // the submission_settled record exactly once, then finalize. A crash between
-// the phases is resolved by reconciliation re-running the record check and
-// finalize (HARNESS-3).
+// the phases is resolved by startup reconciliation.
 func (c *coordinator) settle(ctx context.Context, sub Submission, payload SettledPayload) error {
 	// Use a fresh context bound to the store, not the (possibly cancelled)
 	// run context: settlement must land once the outcome is known.
@@ -226,13 +400,15 @@ func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submissio
 // authors canonical records from the event stream, and tracks turn
 // correlation.
 type submissionRun struct {
-	rt   *Runtime
-	sub  Submission
-	conv Conversation
-	cfg  AgentRuntimeConfig
+	rt       *Runtime
+	sub      Submission
+	conv     Conversation
+	cfg      AgentRuntimeConfig
+	deadline time.Time
 
 	mu     sync.Mutex
 	turnID string
+	halted bool
 }
 
 func (r *submissionRun) currentTurnID() string {
@@ -273,7 +449,8 @@ func (r *submissionRun) append(ctx context.Context, recs ...Record) error {
 }
 
 // drive executes the attempt: input record, prompt, event consumption,
-// terminal result.
+// terminal result. Between turns it halts cooperatively when the durability
+// deadline has passed or the run context ended.
 func (r *submissionRun) drive(ctx context.Context) error {
 	if err := r.appendInputRecord(ctx); err != nil {
 		return err
@@ -294,6 +471,20 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		Tools:        r.cfg.Tools,
 		Skills:       r.cfg.Skills,
 		Session:      proj,
+		Hooks: pi.Hooks{
+			ShouldStopAfterTurn: func(hctx context.Context, c pi.AfterTurnCtx) bool {
+				if ctx.Err() != nil {
+					return true
+				}
+				if time.Now().After(r.deadline) {
+					r.mu.Lock()
+					r.halted = true
+					r.mu.Unlock()
+					return true
+				}
+				return false
+			},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("construct agent: %w", err)
@@ -318,6 +509,15 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	if result.Err != nil {
 		return fmt.Errorf("prompt: %w", result.Err)
 	}
+	r.mu.Lock()
+	halted := r.halted
+	r.mu.Unlock()
+	if halted {
+		return errDeadlineHalted
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
+	}
 	return nil
 }
 
@@ -340,10 +540,8 @@ func (r *submissionRun) appendInputRecord(ctx context.Context) error {
 	return r.append(ctx, rec)
 }
 
-// consumeEvent authors canonical records from one agent event. Walking
-// skeleton set: turn correlation, tool outcomes, completed assistant
-// messages. Delta batching and tool-call starts join in the streaming slice
-// (HARNESS-4).
+// consumeEvent authors canonical records from one agent event. Delta
+// batching joins in the streaming slice (HARNESS-4).
 func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) error {
 	switch e := ev.(type) {
 	case pi.TurnStartEvent:

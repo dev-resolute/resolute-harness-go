@@ -124,12 +124,34 @@ const (
 	SettledFailed    SettledStatus = "failed"
 )
 
+// SettledErrorCode classifies why a submission settled as failed, stable for
+// programmatic branching; Error carries the human-readable detail.
+type SettledErrorCode string
+
+// Failure classifications carried on submission_settled records.
+const (
+	// SettledErrRunFailed is a terminal error from the agent run itself.
+	SettledErrRunFailed SettledErrorCode = "run_failed"
+	// SettledErrAttemptBudget means the max-attempts durability budget was
+	// exhausted.
+	SettledErrAttemptBudget SettledErrorCode = "attempt_budget_exhausted"
+	// SettledErrTimeout means the submission outlived its durability timeout.
+	SettledErrTimeout SettledErrorCode = "timeout_exceeded"
+	// SettledErrIndeterminate means a crash interrupted settlement before the
+	// terminal record landed; the run's outcome is unknown.
+	SettledErrIndeterminate SettledErrorCode = "settlement_indeterminate"
+	// SettledErrResultInvalid means the structured result never validated
+	// against the requested schema within the feedback budget.
+	SettledErrResultInvalid SettledErrorCode = "result_schema_invalid"
+)
+
 // SettledPayload is the payload of a submission_settled record. Result is
 // present only when the prompt requested a structured result.
 type SettledPayload struct {
-	Status SettledStatus   `json:"status"`
-	Error  string          `json:"error,omitempty"`
-	Result json.RawMessage `json:"result,omitempty"`
+	Status    SettledStatus    `json:"status"`
+	Error     string           `json:"error,omitempty"`
+	ErrorCode SettledErrorCode `json:"errorCode,omitempty"`
+	Result    json.RawMessage  `json:"result,omitempty"`
 }
 
 // DecodePayload unmarshals the record payload into dst, which must be a

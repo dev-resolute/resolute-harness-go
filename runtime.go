@@ -28,6 +28,9 @@ type Runtime struct {
 	env    Env
 	logger *slog.Logger
 
+	claimInterval time.Duration
+	leaseDuration time.Duration
+
 	wake chan struct{} // nudges the coordinator claim loop
 
 	mu        sync.Mutex
@@ -54,14 +57,24 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	claimInterval := cfg.ClaimInterval
+	if claimInterval <= 0 {
+		claimInterval = defaultClaimInterval
+	}
+	leaseDuration := cfg.LeaseDuration
+	if leaseDuration <= 0 {
+		leaseDuration = defaultLeaseDuration
+	}
 	return &Runtime{
-		agents:    cfg.Agents,
-		store:     cfg.Store,
-		env:       env,
-		logger:    logger,
-		wake:      make(chan struct{}, 1),
-		appendSub: make(chan struct{}),
-		settleSub: make(chan struct{}),
+		agents:        cfg.Agents,
+		store:         cfg.Store,
+		env:           env,
+		logger:        logger,
+		claimInterval: claimInterval,
+		leaseDuration: leaseDuration,
+		wake:          make(chan struct{}, 1),
+		appendSub:     make(chan struct{}),
+		settleSub:     make(chan struct{}),
 	}, nil
 }
 
