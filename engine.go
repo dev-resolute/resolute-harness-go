@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -248,10 +249,11 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	defer cancelRun(nil)
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
-	runErr := c.driveAttempt(runCtx, sub, cfg, deadline)
+	result, runErr := c.driveAttempt(runCtx, sub, cfg, deadline)
 	cancelRun(nil)
 	<-heartbeatDone
 
+	var invalid *resultInvalidError
 	switch {
 	case errors.Is(context.Cause(runCtx), errLeaseLost):
 		// Another attempt owns the submission now; ours must not settle or
@@ -273,13 +275,17 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 			Error:     fmt.Sprintf("durability timeout exceeded mid-run (budget %s)", timeout),
 			ErrorCode: SettledErrTimeout,
 		}, logger)
+	case errors.As(runErr, &invalid):
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status: SettledFailed, Error: invalid.Error(), ErrorCode: SettledErrResultInvalid,
+		}, logger)
 	case runErr != nil:
 		logger.Error("attempt failed", "error", runErr)
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status: SettledFailed, Error: runErr.Error(), ErrorCode: SettledErrRunFailed,
 		}, logger)
 	default:
-		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded}, logger)
+		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded, Result: result}, logger)
 	}
 }
 
@@ -329,11 +335,12 @@ func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, paylo
 	c.rt.notifySettled()
 }
 
-// driveAttempt runs the agent for one attempt and returns the run error.
-func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) error {
+// driveAttempt runs the agent for one attempt, returning the validated
+// structured result (nil when none was requested) and the run error.
+func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) (json.RawMessage, error) {
 	conv, err := c.rt.store.GetConversation(ctx, sub.SessionKey)
 	if err != nil {
-		return fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
+		return nil, fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
 	}
 	run := &submissionRun{
 		rt:       c.rt,
@@ -342,7 +349,10 @@ func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg Agen
 		cfg:      cfg,
 		deadline: deadline,
 	}
-	return run.drive(ctx)
+	if err := run.drive(ctx); err != nil {
+		return nil, err
+	}
+	return run.result, nil
 }
 
 // settle runs two-phase settlement: reserve the terminal transition, land
@@ -413,6 +423,14 @@ type submissionRun struct {
 	mu     sync.Mutex
 	turnID string
 	halted bool
+
+	// lastAssistantText is the most recent completed assistant text message
+	// — the candidate for structured-result validation.
+	lastAssistantText string
+
+	// result is the validated structured result, set by drive when the
+	// prompt requested one.
+	result json.RawMessage
 
 	// Pending delta batch (accessed only from the event-consuming goroutine).
 	deltaKind    RecordKind
@@ -500,7 +518,19 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	}
 	defer agent.Close()
 
-	stream, err := agent.Prompt(ctx, pi.NewText("user", r.sub.Input.Body), pi.PromptOpts{
+	if err := r.runPrompt(ctx, agent, r.sub.Input.Body); err != nil {
+		return err
+	}
+	if len(r.sub.Input.ResultSchema) > 0 {
+		return r.validateResultLoop(ctx, agent)
+	}
+	return nil
+}
+
+// runPrompt runs one prompt on the agent and consumes its event stream into
+// canonical records.
+func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, body string) error {
+	stream, err := agent.Prompt(ctx, pi.NewText("user", body), pi.PromptOpts{
 		SessionID: pi.SessionID(r.conv.ID),
 	})
 	if err != nil {
@@ -531,6 +561,37 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
 	}
 	return nil
+}
+
+// validateResultLoop validates the final answer against the requested
+// schema, feeding validation errors back as corrective turns under the
+// per-prompt retry budget. The corrective turn is a canonical user_message,
+// so it is visible in the record stream.
+func (r *submissionRun) validateResultLoop(ctx context.Context, agent *pi.Agent) error {
+	retries := r.sub.Input.ResultRetries
+	if retries <= 0 {
+		retries = DefaultResultRetries
+	}
+	for attempt := 0; ; attempt++ {
+		r.mu.Lock()
+		answer := r.lastAssistantText
+		r.mu.Unlock()
+		result, reason := validateStructuredResult(r.sub.Input.ResultSchema, answer)
+		if reason == "" {
+			r.result = result
+			return nil
+		}
+		if attempt >= retries {
+			return &resultInvalidError{reason: reason}
+		}
+		corrective := correctiveMessage(reason, r.sub.Input.ResultSchema)
+		if err := r.append(ctx, r.record(KindUserMessage, &UserMessagePayload{Body: corrective})); err != nil {
+			return err
+		}
+		if err := r.runPrompt(ctx, agent, corrective); err != nil {
+			return err
+		}
+	}
 }
 
 // appendInputRecord authors the user_message (or signal) record for this
@@ -604,6 +665,11 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		}
 		if e.Message.Role != "assistant" {
 			return nil
+		}
+		if text := e.Message.Text(); text != "" {
+			r.mu.Lock()
+			r.lastAssistantText = text
+			r.mu.Unlock()
 		}
 		rec := r.record(KindAssistantMessageCompleted, &AssistantMessageCompletedPayload{
 			Message: messageFromPi(e.Message),

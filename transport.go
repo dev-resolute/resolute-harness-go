@@ -37,12 +37,14 @@ func (t *transport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // dispatchBody is the POST request body: the inbound message plus optional
 // session and dispatch id.
 type dispatchBody struct {
-	Kind        InboundKind     `json:"kind"`
-	Body        string          `json:"body"`
-	Attachments []AttachmentRef `json:"attachments,omitempty"`
-	Signal      *SignalMeta     `json:"signal,omitempty"`
-	Session     string          `json:"session,omitempty"`
-	DispatchID  string          `json:"dispatchId,omitempty"`
+	Kind          InboundKind     `json:"kind"`
+	Body          string          `json:"body"`
+	Attachments   []AttachmentRef `json:"attachments,omitempty"`
+	Signal        *SignalMeta     `json:"signal,omitempty"`
+	ResultSchema  json.RawMessage `json:"resultSchema,omitempty"`
+	ResultRetries int             `json:"resultRetries,omitempty"`
+	Session       string          `json:"session,omitempty"`
+	DispatchID    string          `json:"dispatchId,omitempty"`
 }
 
 func (t *transport) handleDispatch(w http.ResponseWriter, r *http.Request) {
@@ -57,10 +59,12 @@ func (t *transport) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		Session:    body.Session,
 		DispatchID: body.DispatchID,
 		Message: DispatchMessage{
-			Kind:        body.Kind,
-			Body:        body.Body,
-			Attachments: body.Attachments,
-			Signal:      body.Signal,
+			Kind:          body.Kind,
+			Body:          body.Body,
+			Attachments:   body.Attachments,
+			Signal:        body.Signal,
+			ResultSchema:  body.ResultSchema,
+			ResultRetries: body.ResultRetries,
 		},
 	}
 	res, err := t.rt.Dispatch(r.Context(), d)

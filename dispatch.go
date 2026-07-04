@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -24,13 +25,26 @@ type SignalMeta struct {
 	Tag    string            `json:"tag,omitempty"`
 }
 
+// DefaultResultRetries is the feedback-retry budget when a Prompt requests a
+// structured result and leaves ResultRetries at 0.
+const DefaultResultRetries = 2
+
 // DispatchMessage is the inbound payload of a dispatch: a discriminated
-// user-or-signal union. Signal is set exactly when Kind is InboundSignal.
+// user-or-signal union, plus the optional structured-result request. It is
+// stored durably on the submission, so re-attempts and idempotency
+// comparisons see the schema too.
 type DispatchMessage struct {
 	Kind        InboundKind     `json:"kind"`
 	Body        string          `json:"body"`
 	Attachments []AttachmentRef `json:"attachments,omitempty"`
 	Signal      *SignalMeta     `json:"signal,omitempty"`
+	// ResultSchema, when set, is a JSON Schema the run's final answer must
+	// validate against; the validated JSON rides the submission_settled
+	// record.
+	ResultSchema json.RawMessage `json:"resultSchema,omitempty"`
+	// ResultRetries bounds the validate→feedback→retry loop; 0 means
+	// DefaultResultRetries.
+	ResultRetries int `json:"resultRetries,omitempty"`
 }
 
 // UserMessage builds a user-kind DispatchMessage.
