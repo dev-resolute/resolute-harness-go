@@ -72,6 +72,19 @@ http.ListenAndServe(":8484", rt.Handler()) // auth = your middleware
 
 `rt.Dispatch` / `rt.Wait` / `rt.Steer` / `rt.FollowUp` / `rt.Compact` expose the same operations in-process.
 
+## Examples
+
+Every example runs keyless with `go run` (a deterministic local provider stands in for the model) and switches to Gemini when `GEMINI_API_KEY` is set. Each `main.go` opens with a copy-paste runbook.
+
+| Example | Port | What it demonstrates |
+|---|---|---|
+| [`examples/basic`](examples/basic) | 8484 | The walking skeleton: one agent, SQLite store, Observer + Interceptor, one tool, 202/`?wait=true`/SSE, kill-and-restart durability. Start here. |
+| [`examples/chat`](examples/chat) | 8485 | A browser chat client embedded in the binary (no npm): live SSE rendering, durable session switching, and a Steer button that alters a run mid-flight. |
+| [`examples/triage`](examples/triage) | 8486 | Structured results: `resultSchema` on the dispatch, validated JSON on the settled record, the corrective-turn retry visible in the stream, and retry-budget exhaustion. |
+| [`examples/github-bot`](examples/github-bot) | 8487 | A channel in the flue sense: verified GitHub webhook ingress → `signal` dispatches with delivery-id idempotency (replay → same 202, mutated → 409) and a narrow per-issue reply tool. |
+| [`examples/scheduler`](examples/scheduler) | 8488 | Time-driven agents: one signal dispatch per wall-clock window with deterministic dispatch ids, so restarts (or N replicas on one store) never double-fire a window. |
+| [`examples/multitenant`](examples/multitenant) | 8489 | The concurrency contract: per-instance tenant prompts from one definition, head-of-line ordering inside a session, parallelism across sessions and tenants (`load.sh` shows it on a stopwatch). |
+
 ## Writing a store adapter
 
 The store contract (`harness.Store` = `SubmissionStore` + `ConversationStore` + `AttachmentStore`) is one tier for every backend — no SQL-only extensions. The **exported conformance suite is the contract**: a third-party adapter (Postgres, Mongo, …) is correct exactly when it passes the same suite the in-tree memory and SQLite backends pass:
