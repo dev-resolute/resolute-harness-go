@@ -1,0 +1,13 @@
+# Binaries and build artifacts
+*.test
+*.out
+dist/
+
+# Local data
+*.db
+*.sqlite
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
