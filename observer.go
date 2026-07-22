@@ -2,6 +2,9 @@ package harness
 
 import (
 	"context"
+	"fmt"
+
+	pi "github.com/dev-resolute/resolute-agent-core-go"
 )
 
 // Correlation carries the same ids as record envelopes, so observer output
@@ -99,9 +102,41 @@ type CompactionEvent struct {
 // RecoveryEvent reports an engine recovery decision.
 type RecoveryEvent struct {
 	Correlation
-	// Decision is "overflow_compact_retry" or "transient_backoff".
+	// Decision is "overflow_compact_retry", "transient_backoff", or one of
+	// the "summarization_retry_*" lifecycle decisions (scheduled /
+	// attempt_start / finished) relayed from agent-core's
+	// OnSummarizationRetry hook.
 	Decision string
 	Detail   string
+}
+
+// summarizationRetryObserver converts agent-core's OnSummarizationRetry hook
+// calls into RecoveryEvents. Compact has no event stream in agent-core, so
+// this hook is how operators observe summarization retries (agent-core
+// v0.7.0, upstream 0.81.1). The returned hook is safe for the concurrent
+// calls split-turn summarization can make, as long as observe is.
+func summarizationRetryObserver(observe func(HarnessEvent), corr Correlation) func(context.Context, pi.SummarizationRetryCtx) {
+	return func(_ context.Context, c pi.SummarizationRetryCtx) {
+		var decision, detail string
+		switch c.Phase {
+		case pi.SummarizationRetryScheduled:
+			decision = "summarization_retry_scheduled"
+			detail = fmt.Sprintf("attempt %d/%d in %s: %v", c.Attempt, c.MaxAttempts, c.Delay, c.Err)
+		case pi.SummarizationRetryAttemptStart:
+			decision = "summarization_retry_attempt_start"
+			detail = fmt.Sprintf("attempt %d", c.Attempt)
+		case pi.SummarizationRetryFinished:
+			decision = "summarization_retry_finished"
+			if c.Success {
+				detail = fmt.Sprintf("succeeded on attempt %d", c.Attempt)
+			} else if c.Err != nil {
+				detail = c.Err.Error()
+			}
+		default:
+			return
+		}
+		observe(RecoveryEvent{Correlation: corr, Decision: decision, Detail: detail})
+	}
 }
 
 func (SubmissionAdmittedEvent) isHarnessEvent() {}

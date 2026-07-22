@@ -16,6 +16,8 @@ _Avoid:_ thread, chat.
 
 **Turn** — one `pi.Agent` LLM round-trip inside an operation. The harness never implements turn mechanics; agent-core owns them.
 
+**Summarization retry** — agent-core's bounded retry of transient summarization failures during a `Compact` operation (agent-core v0.7.0, upstream 0.81.1). Configured per agent via `AgentRuntimeConfig.SummarizationRetry` (zero value disables); lifecycle surfaces to Observers as `RecoveryEvent` decisions `summarization_retry_scheduled` / `summarization_retry_attempt_start` / `summarization_retry_finished`.
+
 ## Durability
 
 **Dispatch** — an inbound request to run work: `{agent, instance id, DispatchMessage}`. Admission, not execution.

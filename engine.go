@@ -553,15 +553,17 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		turnID:       r.currentTurnID,
 	}
 	agent, err := pi.NewAgent(pi.AgentConfig{
-		Providers:        r.interceptedProviders(),
-		DefaultModel:     r.cfg.Model,
-		SystemPrompt:     r.cfg.SystemPrompt,
-		Tools:            r.interceptedTools(),
-		Skills:           r.cfg.Skills,
-		ReserveTokens:    r.cfg.ReserveTokens,
-		KeepRecentTokens: r.cfg.KeepRecentTokens,
-		Session:          proj,
+		Providers:          r.interceptedProviders(),
+		DefaultModel:       r.cfg.Model,
+		SystemPrompt:       r.cfg.SystemPrompt,
+		Tools:              r.interceptedTools(),
+		Skills:             r.cfg.Skills,
+		ReserveTokens:      r.cfg.ReserveTokens,
+		KeepRecentTokens:   r.cfg.KeepRecentTokens,
+		SummarizationRetry: r.cfg.SummarizationRetry,
+		Session:            proj,
 		Hooks: pi.Hooks{
+			OnSummarizationRetry: summarizationRetryObserver(r.rt.observe, r.correlation()),
 			ShouldStopAfterTurn: func(hctx context.Context, c pi.AfterTurnCtx) bool {
 				if ctx.Err() != nil {
 					return true

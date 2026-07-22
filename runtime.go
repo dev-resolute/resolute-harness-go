@@ -329,23 +329,27 @@ func (rt *Runtime) Compact(ctx context.Context, req CompactRequest) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
+	corr := Correlation{SessionKey: key, ConversationID: conv.ID}
 	agent, err := pi.NewAgent(pi.AgentConfig{
-		Providers:        cfg.Providers,
-		DefaultModel:     cfg.Model,
-		SystemPrompt:     cfg.SystemPrompt,
-		ReserveTokens:    cfg.ReserveTokens,
-		KeepRecentTokens: cfg.KeepRecentTokens,
+		Providers:          cfg.Providers,
+		DefaultModel:       cfg.Model,
+		SystemPrompt:       cfg.SystemPrompt,
+		ReserveTokens:      cfg.ReserveTokens,
+		KeepRecentTokens:   cfg.KeepRecentTokens,
+		SummarizationRetry: cfg.SummarizationRetry,
 		Session: &projection{
 			store:        rt.store,
 			conv:         conv,
 			systemPrompt: cfg.SystemPrompt,
+		},
+		Hooks: pi.Hooks{
+			OnSummarizationRetry: summarizationRetryObserver(rt.observe, corr),
 		},
 	})
 	if err != nil {
 		return fmt.Errorf("construct agent: %w", err)
 	}
 	defer agent.Close()
-	corr := Correlation{SessionKey: key, ConversationID: conv.ID}
 	rt.observe(OperationStartedEvent{Correlation: corr, Operation: "compact"})
 	err = rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "compact", Correlation: corr}, func(c context.Context) error {
 		_, cerr := agent.Compact(c, pi.CompactOpts{SessionID: pi.SessionID(conv.ID)})

@@ -48,6 +48,12 @@ type AgentRuntimeConfig struct {
 	// point; zero values use agent-core's defaults.
 	ReserveTokens    int
 	KeepRecentTokens int
+	// SummarizationRetry configures agent-core's bounded retry of transient
+	// summarization failures during Compact (agent-core v0.7.0). The zero
+	// value disables retries; enabling it keeps a transient 429/5xx from
+	// failing a compaction outright. Retry lifecycle is surfaced to
+	// Observers as RecoveryEvents.
+	SummarizationRetry pi.SummarizationRetryPolicy
 	// MaxAttempts is the durability budget on execution tries, recomputed
 	// from durable history on every claim; 0 means DefaultMaxAttempts.
 	MaxAttempts int
