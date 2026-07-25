@@ -84,6 +84,7 @@ Every example runs keyless with `go run` (a deterministic local provider stands 
 | [`examples/github-bot`](examples/github-bot) | 8487 | A channel in the flue sense: verified GitHub webhook ingress → `signal` dispatches with delivery-id idempotency (replay → same 202, mutated → 409) and a narrow per-issue reply tool. |
 | [`examples/scheduler`](examples/scheduler) | 8488 | Time-driven agents: one signal dispatch per wall-clock window with deterministic dispatch ids, so restarts (or N replicas on one store) never double-fire a window. |
 | [`examples/multitenant`](examples/multitenant) | 8489 | The concurrency contract: per-instance tenant prompts from one definition, head-of-line ordering inside a session, parallelism across sessions and tenants (`load.sh` shows it on a stopwatch). |
+| [`examples/coder`](examples/coder) | 8490 | The built-in tool ecosystem: a coding assistant wired to the four execution tools (`read`/`write`/`edit`/`bash`) rooted at a workspace directory, with a stdout observer narrating tool activity — including `ToolCallUpdatedEvent`'s streamed partial results from a running bash command. |
 
 ## Writing a store adapter
 
