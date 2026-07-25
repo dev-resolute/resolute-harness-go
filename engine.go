@@ -801,6 +801,9 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 			ThoughtSignature: e.ThoughtSignature,
 		})
 		return r.append(ctx, rec)
+	case pi.ToolUpdateEvent:
+		r.rt.observe(ToolCallUpdatedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.Name, Result: e.Result})
+		return nil
 	case pi.ToolCallEndEvent:
 		r.rt.observe(ToolCallEndedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.ToolName, IsError: e.Result.IsError})
 		if err := r.flushDeltas(ctx); err != nil {

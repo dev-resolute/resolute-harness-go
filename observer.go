@@ -93,6 +93,15 @@ type ToolCallEndedEvent struct {
 	IsError  bool
 }
 
+// ToolCallUpdatedEvent reports a partial-result snapshot from a running
+// tool. Ephemeral: observer-only, never recorded.
+type ToolCallUpdatedEvent struct {
+	Correlation
+	CallID   string
+	ToolName string
+	Result   pi.ToolResult
+}
+
 // CompactionEvent reports a compaction landing (manual or recovery-driven).
 type CompactionEvent struct {
 	Correlation
@@ -150,6 +159,7 @@ func (TurnEndedEvent) isHarnessEvent()          {}
 func (DeltaEvent) isHarnessEvent()              {}
 func (ToolCallStartedEvent) isHarnessEvent()    {}
 func (ToolCallEndedEvent) isHarnessEvent()      {}
+func (ToolCallUpdatedEvent) isHarnessEvent()    {}
 func (CompactionEvent) isHarnessEvent()         {}
 func (RecoveryEvent) isHarnessEvent()           {}
 
