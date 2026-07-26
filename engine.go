@@ -31,6 +31,13 @@ var errLeaseLost = errors.New("lease lost to another attempt")
 // (cooperative halt at a turn boundary).
 var errDeadlineHalted = errors.New("durability timeout reached mid-run")
 
+// danglingToolCallMessage is the harness-owned synthesized tool_outcome
+// content for a tool call recovered with no result: the process crashed
+// between the durable assistant_tool_call record and its tool_outcome, so
+// the outcome is genuinely unknown. Byte-exact (HARNESS-14; harness half of
+// upstream #6285) — this string is not an upstream port.
+const danglingToolCallMessage = "Tool call was interrupted before a result was recorded (the run was recovered). Re-issue the tool call if it is still needed."
+
 // overflowCompactRetries bounds the in-attempt overflow ladder: each
 // overflow triggers one compact-and-retry, at most this many times.
 const overflowCompactRetries = 2
@@ -543,6 +550,15 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	if err := r.appendInputRecord(ctx); err != nil {
 		return err
 	}
+	// Only a re-claimed attempt can inherit a dangling tool call — a prior
+	// attempt died mid-tool-execution. A first attempt (AttemptCount == 1)
+	// authors call and outcome from its own single event stream, with no
+	// crash window between them, so it never pays the scan.
+	if r.sub.AttemptCount > 1 {
+		if err := r.reconcileDanglingToolCalls(ctx); err != nil {
+			return err
+		}
+	}
 
 	proj := &projection{
 		store:        r.rt.store,
@@ -634,6 +650,63 @@ func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, msg p
 		}
 		return &transientRunError{err: err}
 	}
+}
+
+// reconcileDanglingToolCalls appends a synthesized error tool_outcome for
+// every assistant_tool_call on the active leaf path that has no matching
+// tool_outcome. A crash between the two records would otherwise replay a bare
+// tool call straight into the provider on recovery, which deterministic-4xx
+// providers reject (HARNESS-14; harness half of upstream #6285).
+func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
+	recs, err := r.rt.store.ReadRecords(ctx, r.conv.ID, "")
+	if err != nil {
+		return fmt.Errorf("read records for dangling tool call reconciliation: %w", err)
+	}
+
+	// order preserves path order so synthesized outcomes append in the same
+	// order their calls were made; pending tracks which calls still lack an
+	// outcome as the path is walked.
+	type danglingCall struct {
+		callID   string
+		toolName string
+	}
+	var order []danglingCall
+	pending := make(map[string]bool)
+
+	for _, rec := range Reduce(recs).ActiveLeafPath() {
+		switch rec.Kind {
+		case KindAssistantToolCall:
+			var p AssistantToolCallPayload
+			if err := rec.DecodePayload(&p); err != nil {
+				return fmt.Errorf("decode assistant_tool_call for reconciliation: %w", err)
+			}
+			order = append(order, danglingCall{callID: p.CallID, toolName: p.ToolName})
+			pending[p.CallID] = true
+		case KindToolOutcome:
+			var p ToolOutcomePayload
+			if err := rec.DecodePayload(&p); err != nil {
+				return fmt.Errorf("decode tool_outcome for reconciliation: %w", err)
+			}
+			delete(pending, p.CallID)
+		}
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	var synthesized []Record
+	for _, call := range order {
+		if !pending[call.callID] {
+			continue
+		}
+		synthesized = append(synthesized, r.record(KindToolOutcome, &ToolOutcomePayload{
+			CallID:   call.callID,
+			ToolName: call.toolName,
+			IsError:  true,
+			Content:  danglingToolCallMessage,
+		}))
+	}
+	return r.append(ctx, synthesized...)
 }
 
 // transientBackoff derives the retry delay from the durable attempt count:
