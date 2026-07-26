@@ -33,7 +33,7 @@ _Avoid:_ job, task (conflicts with the future `Task` operation).
 
 **Settlement** — the two-phase terminal transition (`ReserveSettlement` → `FinalizeSettlement`) guaranteeing exactly one durable terminal record.
 
-**Reconciliation** — startup scan that hands interrupted `running` submissions to fresh attempts.
+**Reconciliation** — covers two scans, both idempotent and both replaying-safe: the *startup* scan that hands interrupted `running` submissions to fresh attempts, and the *dangling-call* scan (`reconcileDanglingToolCalls`) that runs on every drive to synthesize an error `tool_outcome` for any `assistant_tool_call` left on the active leaf path with no matching outcome — conversation-scoped, not submission-scoped, so it also catches a call left dangling by an earlier submission that already settled failed.
 
 ## Conversation
 

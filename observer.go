@@ -111,10 +111,10 @@ type CompactionEvent struct {
 // RecoveryEvent reports an engine recovery decision.
 type RecoveryEvent struct {
 	Correlation
-	// Decision is "overflow_compact_retry", "transient_backoff", or one of
-	// the "summarization_retry_*" lifecycle decisions (scheduled /
-	// attempt_start / finished) relayed from agent-core's
-	// OnSummarizationRetry hook.
+	// Decision is "overflow_compact_retry", "transient_backoff",
+	// "dangling_tool_call_reconciled", or one of the "summarization_retry_*"
+	// lifecycle decisions (scheduled / attempt_start / finished) relayed from
+	// agent-core's OnSummarizationRetry hook.
 	Decision string
 	Detail   string
 }

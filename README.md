@@ -107,8 +107,8 @@ Channel adapters (Slack, Discord, …), a client SDK, React bindings, a dev cons
 ## Layering
 
 ```
-resolute-llm-go        LLM providers, streaming        (v0.8.0)
-resolute-agent-core-go agent loop, tools, skills       (v0.6.1)
+resolute-llm-go        LLM providers, streaming        (v0.10.1)
+resolute-agent-core-go agent loop, tools, skills       (v0.9.0)
 resolute-harness-go    sessions, durability, transport (this repo)
 ```
 

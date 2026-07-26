@@ -44,7 +44,7 @@ func (p *batchProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.Even
 				if err := emit(llm.ToolCallStartEvent{CallID: tc.CallID, ToolName: tc.ToolName, Args: tc.Args}); err != nil {
 					return nil, err
 				}
-				if err := emit(llm.ToolCallEndEvent{CallID: tc.CallID}); err != nil {
+				if err := emit(llm.ToolCallEndEvent{CallID: tc.CallID, ToolName: tc.ToolName, Args: tc.Args}); err != nil {
 					return nil, err
 				}
 				msgs = append(msgs, llm.Message{Role: "assistant", Content: tc})

@@ -16,6 +16,9 @@ type CompactionPayload struct {
 	FirstKeptEntryID string `json:"firstKeptEntryId,omitempty"`
 	StartIdx         int    `json:"startIdx"`
 	EndIdx           int    `json:"endIdx"`
+	// Usage is the summarization usage from the agent's BranchSummary; nil
+	// when the provider reported none (AGENT-20 follow-through).
+	Usage *pi.Usage `json:"usage,omitempty"`
 }
 
 func (*CompactionPayload) payloadKind() RecordKind { return KindCompaction }
@@ -153,6 +156,7 @@ func (p *projection) AppendBranchSummary(ctx context.Context, id pi.SessionID, s
 			FirstKeptEntryID: firstKept,
 			StartIdx:         summary.StartIdx,
 			EndIdx:           summary.EndIdx,
+			Usage:            summary.Usage,
 		}),
 	}
 	if p.turnID != nil {
