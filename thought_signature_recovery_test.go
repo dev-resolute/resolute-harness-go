@@ -57,7 +57,7 @@ func (p *signatureProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.
 			if err := emit(llm.ToolCallStartEvent{CallID: tc.CallID, ToolName: tc.ToolName, Args: tc.Args, ThoughtSignature: tc.ThoughtSignature}); err != nil {
 				return nil, err
 			}
-			if err := emit(llm.ToolCallEndEvent{CallID: tc.CallID}); err != nil {
+			if err := emit(llm.ToolCallEndEvent{CallID: tc.CallID, ToolName: tc.ToolName, Args: tc.Args, ThoughtSignature: tc.ThoughtSignature}); err != nil {
 				return nil, err
 			}
 			if err := emit(llm.MessageEndEvent{}); err != nil {
