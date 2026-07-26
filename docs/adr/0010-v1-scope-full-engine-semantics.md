@@ -15,6 +15,6 @@ flue's full surface is runtime + CLI + SDK + React + dev-console + ~25 adapters.
 ## Consequences
 
 - Crash-restart recovery works in v1 and is pinned by crash tests (kill between every pair of engine phases).
-- Multi-node later is a Postgres store adapter, not an engine change.
+- Multi-node later is a Postgres store adapter, not an engine change — except that zombie-append fencing (stopping a released or reclaimed attempt's goroutine, which hasn't yet noticed its lease is gone, from still appending records) currently relies on the coordinator's in-process session guard, so a multi-node store adapter must add its own cross-process fencing before that guard can be dropped.
 - Single-process SQLite pays a small awkwardness tax (leases guarding against your own restarts) — accepted as the price of never retrofitting invariants.
 - Every deferred item has a designed seam (channel model, store contract growth, tree branches for task) so deferral is scheduling, not redesign.
