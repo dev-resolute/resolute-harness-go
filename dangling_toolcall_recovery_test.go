@@ -263,3 +263,209 @@ func TestRecoveryDanglingToolCallReconciliationNoOpWithOutcome(t *testing.T) {
 		t.Fatalf("tool_outcome records = %d, want exactly 1 (reconciliation must not synthesize an outcome when one already exists)", outcomeCount)
 	}
 }
+
+// TestRecoveryReconcilesDanglingToolCallAcrossSubmissions pins the
+// conversation-scoped fix for HARNESS-14: the dangling-call hazard is not
+// limited to a re-claimed attempt of the SAME submission. Submission 1
+// settles failed (e.g. attempt-budget exhaustion, a durability timeout, or an
+// initialize failure) with a dangling assistant_tool_call still on the
+// active leaf path. Submission 2, admitted afterward on the SAME
+// conversation, starts at its own fresh AttemptCount == 1 — the exact case
+// an AttemptCount > 1 gate would skip, poisoning every later submission on
+// the conversation forever. The engine must reconcile submission 1's
+// dangling call before submission 2's own first prompt.
+func TestRecoveryReconcilesDanglingToolCallAcrossSubmissions(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	ctx := context.Background()
+
+	key := harness.SessionKey{Agent: "support", Instance: "acme", Session: "default"}
+	conv, _, err := store.EnsureConversation(ctx, harness.Conversation{
+		ID:        "01A0XCONV0000000000000000",
+		Key:       key,
+		CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+
+	// Submission 1: claim it, author its input and a dangling tool call
+	// (no matching tool_outcome — the crash window HARNESS-14 targets), then
+	// settle it failed directly through the store, as a genuinely terminal
+	// submission rather than a re-claimable running one.
+	sub1, err := store.AdmitSubmission(ctx, harness.Submission{
+		ID:             "01A0XSUB10000000000000001",
+		SessionKey:     key,
+		ConversationID: conv.ID,
+		Status:         harness.StatusQueued,
+		Input:          harness.UserMessage("look up the weather"),
+		CreatedAt:      time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("AdmitSubmission sub1: %v", err)
+	}
+	claimed1, err := store.ClaimSubmission(ctx, harness.SubmissionClaim{
+		SubmissionID:   sub1.ID,
+		AttemptID:      "01A0XATTEMPT0000000000001",
+		OwnerID:        "owner-1",
+		LeaseExpiresAt: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ClaimSubmission sub1: %v", err)
+	}
+	if err := store.StartAttempt(ctx, harness.Attempt{
+		ID: claimed1.AttemptID, SubmissionID: sub1.ID, OwnerID: "owner-1", StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("StartAttempt sub1: %v", err)
+	}
+
+	userRec := harness.Record{
+		RecordEnvelope: harness.RecordEnvelope{
+			ID:             "01A0XREC000000000000000001",
+			Kind:           harness.KindUserMessage,
+			ConversationID: conv.ID,
+			Session:        "default",
+			SubmissionID:   sub1.ID,
+			AttemptID:      claimed1.AttemptID,
+			Time:           time.Now(),
+		},
+	}
+	userRec.Payload, _ = json.Marshal(harness.UserMessagePayload{Body: "look up the weather"})
+	toolCallRec := harness.Record{
+		RecordEnvelope: harness.RecordEnvelope{
+			ID:             "01A0XREC000000000000000002",
+			Kind:           harness.KindAssistantToolCall,
+			ConversationID: conv.ID,
+			Session:        "default",
+			SubmissionID:   sub1.ID,
+			AttemptID:      claimed1.AttemptID,
+			Time:           time.Now(),
+		},
+	}
+	toolCallRec.Payload, _ = json.Marshal(harness.AssistantToolCallPayload{
+		CallID:   "c1",
+		ToolName: "get_weather",
+		Args:     json.RawMessage(`{"city":"Berlin"}`),
+	})
+	if err := store.AppendRecords(ctx, conv.ID, []harness.Record{userRec, toolCallRec}); err != nil {
+		t.Fatalf("AppendRecords sub1: %v", err)
+	}
+
+	if err := store.ReserveSettlement(ctx, sub1.ID, claimed1.AttemptID); err != nil {
+		t.Fatalf("ReserveSettlement sub1: %v", err)
+	}
+	settledRec := harness.Record{
+		RecordEnvelope: harness.RecordEnvelope{
+			ID:             "01A0XREC000000000000000003",
+			Kind:           harness.KindSubmissionSettled,
+			ConversationID: conv.ID,
+			Session:        "default",
+			SubmissionID:   sub1.ID,
+			AttemptID:      claimed1.AttemptID,
+			Time:           time.Now(),
+		},
+	}
+	settledRec.Payload, _ = json.Marshal(harness.SettledPayload{
+		Status:    harness.SettledFailed,
+		Error:     "attempt budget exhausted (test-simulated settle-failed with a dangling tool call)",
+		ErrorCode: harness.SettledErrAttemptBudget,
+	})
+	if err := store.AppendRecords(ctx, conv.ID, []harness.Record{settledRec}); err != nil {
+		t.Fatalf("AppendRecords settled sub1: %v", err)
+	}
+	if err := store.FinalizeSettlement(ctx, sub1.ID); err != nil {
+		t.Fatalf("FinalizeSettlement sub1: %v", err)
+	}
+
+	// Submission 2: admitted fresh on the SAME conversation/session after
+	// submission 1 settled. Its own AttemptCount will be 1 on its first
+	// (only) claim — the case the old AttemptCount > 1 gate missed entirely.
+	sub2, err := store.AdmitSubmission(ctx, harness.Submission{
+		ID:             "01A0XSUB20000000000000002",
+		SessionKey:     key,
+		ConversationID: conv.ID,
+		Status:         harness.StatusQueued,
+		Input:          harness.UserMessage("what's next?"),
+		CreatedAt:      time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("AdmitSubmission sub2: %v", err)
+	}
+
+	provider := &recordingTextProvider{}
+	rt := startDanglingRuntime(t, store, provider)
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	settled, err := rt.Wait(waitCtx, sub2.ID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if settled.Status != harness.SettledSucceeded {
+		t.Fatalf("settled = %+v, want succeeded", settled)
+	}
+	if sub2Final, err := store.GetSubmission(waitCtx, sub2.ID); err != nil {
+		t.Fatalf("GetSubmission sub2: %v", err)
+	} else if sub2Final.AttemptCount != 1 {
+		t.Fatalf("sub2 AttemptCount = %d, want 1 (reconciliation must fire on a submission's own first attempt)", sub2Final.AttemptCount)
+	}
+
+	recs, err := rt.Records(waitCtx, conv.ID, "")
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+
+	// (a) submission 1's dangling call "c1" was reconciled — a synthesized
+	// error tool_outcome exists — even though it was submission 2's drive
+	// that produced it.
+	var found *harness.ToolOutcomePayload
+	for _, rec := range recs {
+		if rec.Kind != harness.KindToolOutcome {
+			continue
+		}
+		var p harness.ToolOutcomePayload
+		if err := rec.DecodePayload(&p); err != nil {
+			t.Fatalf("DecodePayload: %v", err)
+		}
+		if p.CallID == "c1" {
+			cp := p
+			found = &cp
+		}
+	}
+	if found == nil {
+		t.Fatal("no synthesized tool_outcome for call c1 — submission 2 never reconciled submission 1's dangling call")
+	}
+	if !found.IsError {
+		t.Errorf("synthesized tool_outcome IsError = false, want true")
+	}
+	if found.Content != danglingToolCallMessage {
+		t.Errorf("synthesized tool_outcome Content = %q, want %q", found.Content, danglingToolCallMessage)
+	}
+
+	// (b) submission 2's OWN prompt request to the provider already carries
+	// the synthesized result immediately after the seeded call — reconciled
+	// before its first prompt, not after.
+	var sawCall, sawAdjacentResult bool
+	for _, req := range provider.requests() {
+		for i, m := range req.Messages {
+			tc, ok := m.Content.(llm.ToolCallContent)
+			if !ok || tc.CallID != "c1" {
+				continue
+			}
+			sawCall = true
+			if i+1 >= len(req.Messages) {
+				t.Fatalf("tool call %q is the last message in the request — dangling tail", tc.CallID)
+			}
+			res, ok := req.Messages[i+1].Content.(llm.ToolResultContent)
+			if !ok || res.CallID != "c1" {
+				t.Fatalf("message after tool call %q = %#v, want a matching ToolResultContent", tc.CallID, req.Messages[i+1].Content)
+			}
+			sawAdjacentResult = true
+		}
+	}
+	if !sawCall {
+		t.Fatal("submission 2's prompt never replayed submission 1's tool call c1")
+	}
+	if !sawAdjacentResult {
+		t.Fatal("submission 2's prompt replayed tool call c1 without an adjacent tool result")
+	}
+}
