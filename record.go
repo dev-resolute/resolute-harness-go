@@ -26,6 +26,7 @@ const (
 	KindAssistantMessageCompleted RecordKind = "assistant_message_completed"
 	KindCompaction                RecordKind = "compaction"
 	KindSubmissionSettled         RecordKind = "submission_settled"
+	KindTaskSpawned               RecordKind = "task_spawned"
 )
 
 // RecordEnvelope is the correlation header every canonical record carries.
@@ -81,6 +82,15 @@ type ConversationCreatedPayload struct {
 	Agent    string     `json:"agent"`
 	Instance InstanceID `json:"instance"`
 	Session  string     `json:"session"`
+	// ParentRef links a child conversation to the task_spawned record that
+	// created it (HARNESS-15); nil for root conversations.
+	ParentRef *ParentRef `json:"parentRef,omitempty"`
+}
+
+// ParentRef is the upward link on a child conversation.
+type ParentRef struct {
+	ConversationID string `json:"conversationId"`
+	SpawnRecordID  string `json:"spawnRecordId"`
 }
 
 // UserMessagePayload is the payload of a user_message record.
@@ -189,6 +199,17 @@ type SettledPayload struct {
 	Result    json.RawMessage  `json:"result,omitempty"`
 }
 
+// TaskSpawnedPayload is the payload of a task_spawned record: a parent run
+// admitted a durable child submission for the named task call (HARNESS-15).
+type TaskSpawnedPayload struct {
+	CallID              string `json:"callId"`
+	Agent               string `json:"agent"`
+	ChildInstance       string `json:"childInstance"`
+	ChildConversationID string `json:"childConversationId"`
+	ChildSubmissionID   string `json:"childSubmissionId"`
+	Prompt              string `json:"prompt"`
+}
+
 // DecodePayload unmarshals the record payload into dst, which must be a
 // pointer to the payload type matching the record kind.
 func (r Record) DecodePayload(dst interface{ payloadKind() RecordKind }) error {
@@ -214,7 +235,8 @@ func (*ToolOutcomePayload) payloadKind() RecordKind       { return KindToolOutco
 func (*AssistantMessageCompletedPayload) payloadKind() RecordKind {
 	return KindAssistantMessageCompleted
 }
-func (*SettledPayload) payloadKind() RecordKind { return KindSubmissionSettled }
+func (*SettledPayload) payloadKind() RecordKind     { return KindSubmissionSettled }
+func (*TaskSpawnedPayload) payloadKind() RecordKind { return KindTaskSpawned }
 
 // mustPayload marshals a payload value, panicking on failure. Payload types
 // are plain data structs; a marshal failure is a programmer error.

@@ -159,6 +159,16 @@ func (rt *Runtime) Close() error {
 	}
 }
 
+// SpawnParent identifies the parent run of a spawned dispatch (HARNESS-15).
+// Set by the task tool; direct callers rarely need it.
+type SpawnParent struct {
+	SubmissionID   string
+	CallID         string
+	ConversationID string
+	SpawnRecordID  string // filled by the task tool after task_spawned lands
+	Depth          int
+}
+
 // Dispatch admits one unit of work in-process — the same admission path the
 // HTTP transport uses. It returns as soon as the submission is durable.
 func (rt *Runtime) Dispatch(ctx context.Context, d Dispatch) (DispatchResult, error) {
@@ -190,6 +200,17 @@ func (rt *Runtime) Dispatch(ctx context.Context, d Dispatch) (DispatchResult, er
 		return DispatchResult{}, fmt.Errorf("ensure conversation: %w", err)
 	}
 	if created {
+		createdPayload := &ConversationCreatedPayload{
+			Agent:    key.Agent,
+			Instance: key.Instance,
+			Session:  key.Session,
+		}
+		if d.Parent != nil {
+			createdPayload.ParentRef = &ParentRef{
+				ConversationID: d.Parent.ConversationID,
+				SpawnRecordID:  d.Parent.SpawnRecordID,
+			}
+		}
 		rec := Record{
 			RecordEnvelope: RecordEnvelope{
 				ID:             newULID(),
@@ -198,11 +219,7 @@ func (rt *Runtime) Dispatch(ctx context.Context, d Dispatch) (DispatchResult, er
 				Session:        key.Session,
 				Time:           time.Now(),
 			},
-			Payload: mustPayload(&ConversationCreatedPayload{
-				Agent:    key.Agent,
-				Instance: key.Instance,
-				Session:  key.Session,
-			}),
+			Payload: mustPayload(createdPayload),
 		}
 		if err := rt.store.AppendRecords(ctx, conv.ID, []Record{rec}); err != nil {
 			return DispatchResult{}, fmt.Errorf("append conversation_created: %w", err)
@@ -210,14 +227,20 @@ func (rt *Runtime) Dispatch(ctx context.Context, d Dispatch) (DispatchResult, er
 		rt.notifyAppend()
 	}
 
-	sub, err := rt.store.AdmitSubmission(ctx, Submission{
+	submission := Submission{
 		ID:             submissionID,
 		SessionKey:     key,
 		ConversationID: conv.ID,
 		Status:         StatusQueued,
 		Input:          d.Message,
 		CreatedAt:      time.Now(),
-	})
+	}
+	if d.Parent != nil {
+		submission.ParentSubmissionID = d.Parent.SubmissionID
+		submission.ParentCallID = d.Parent.CallID
+		submission.Depth = d.Parent.Depth + 1
+	}
+	sub, err := rt.store.AdmitSubmission(ctx, submission)
 	if err != nil {
 		return DispatchResult{}, fmt.Errorf("admit submission: %w", err)
 	}

@@ -207,3 +207,70 @@ func testDispatchPromptSettles(t *testing.T, store harness.Store) {
 		}
 	}
 }
+
+// TestDispatchWithParentLinksChild covers the spawned-dispatch admission
+// path (HARNESS-15): a Dispatch carrying a Parent produces a
+// conversation_created record with the ParentRef and a child submission
+// linked back to the parent at depth parent+1.
+func TestDispatchWithParentLinksChild(t *testing.T) {
+	t.Parallel()
+	forEachStore(t, testDispatchWithParentLinksChild)
+}
+
+func testDispatchWithParentLinksChild(t *testing.T, store harness.Store) {
+	provider := mock.New("mock")
+	provider.OnAny().RespondText("child answer").Add()
+	rt := newTestRuntimeOn(t, provider, store)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent:    "support",
+		Instance: "acme-call-1",
+		Message:  harness.UserMessage("summarize the thread"),
+		Parent: &harness.SpawnParent{
+			SubmissionID:   "sub-parent",
+			CallID:         "call-1",
+			ConversationID: "conv-parent",
+			SpawnRecordID:  "rec-spawn",
+			Depth:          0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(recs) == 0 || recs[0].Kind != harness.KindConversationCreated {
+		t.Fatalf("first record = %+v, want conversation_created", recs)
+	}
+	var created harness.ConversationCreatedPayload
+	if err := recs[0].DecodePayload(&created); err != nil {
+		t.Fatalf("DecodePayload: %v", err)
+	}
+	if created.ParentRef == nil {
+		t.Fatal("conversation_created ParentRef = nil, want non-nil")
+	}
+	wantRef := harness.ParentRef{ConversationID: "conv-parent", SpawnRecordID: "rec-spawn"}
+	if *created.ParentRef != wantRef {
+		t.Errorf("ParentRef = %+v, want %+v", *created.ParentRef, wantRef)
+	}
+
+	sub, err := store.GetSubmission(ctx, res.SubmissionID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if sub.ParentSubmissionID != "sub-parent" {
+		t.Errorf("ParentSubmissionID = %q, want %q", sub.ParentSubmissionID, "sub-parent")
+	}
+	if sub.ParentCallID != "call-1" {
+		t.Errorf("ParentCallID = %q, want %q", sub.ParentCallID, "call-1")
+	}
+	if sub.Depth != 1 {
+		t.Errorf("Depth = %d, want parent depth 0 + 1", sub.Depth)
+	}
+}

@@ -91,6 +91,10 @@ type Dispatch struct {
 	Session    string // empty means "default"
 	DispatchID string
 	Message    DispatchMessage
+	// Parent, when set, marks the dispatch as a spawned child run
+	// (HARNESS-15); admission links the conversation and submission back to
+	// the parent run.
+	Parent *SpawnParent
 }
 
 // DispatchResult is the admission receipt: the durable submission created
