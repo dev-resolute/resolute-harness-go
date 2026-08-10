@@ -101,7 +101,9 @@ type SubmissionStore interface {
 	// ClaimSubmission atomically moves the submission queued→running,
 	// recording the attempt id, owner, and lease expiry, and incrementing
 	// AttemptCount. It returns ErrClaimLost when the submission is not
-	// queued.
+	// queued. The claim consumes PendingResume: the returned row carries it
+	// (the drive branches Resume vs Prompt on it) while the stored row
+	// clears it.
 	ClaimSubmission(ctx context.Context, claim SubmissionClaim) (Submission, error)
 	// StartAttempt durably records the attempt marker. It is written after a
 	// successful claim and before any work.
@@ -125,6 +127,8 @@ type SubmissionStore interface {
 	// ErrClaimLost when the attempt no longer owns the submission.
 	WaitSubmission(ctx context.Context, wait SubmissionWait) error
 	// ResumeSubmission CAS-transitions waiting→queued (a wake landed).
+	// PendingResume survives the requeue; the claim that re-drives the
+	// submission consumes it.
 	ResumeSubmission(ctx context.Context, submissionID string) error
 	// ListChildSubmissions returns submissions spawned by parentSubmissionID.
 	ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]Submission, error)

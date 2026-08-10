@@ -56,7 +56,9 @@ type Submission struct {
 	// Depth is the spawn depth (0 for root dispatches; child = parent+1).
 	Depth int `json:"depth,omitempty"`
 	// PendingResume marks a submission parked in waiting whose next drive
-	// must Resume (not Prompt) — set by WaitSubmission, cleared by ResumeSubmission.
+	// must Resume (not Prompt) — set by WaitSubmission, kept by
+	// ResumeSubmission, consumed by the claim that re-drives it (the claimed
+	// row carries the flag; the stored row clears it).
 	PendingResume bool `json:"pendingResume,omitempty"`
 	// WaitUntil bounds the wait when SubagentLimits.MaxWait is set; zero = unbounded.
 	WaitUntil time.Time `json:"waitUntil,omitzero"`

@@ -176,7 +176,14 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	sub.OwnerID = claim.OwnerID
 	sub.LeaseExpiresAt = claim.LeaseExpiresAt
 	sub.AttemptCount++
+	// The claim consumes PendingResume: the returned row carries it so the
+	// drive branches Resume vs Prompt on it; the stored row clears it, so a
+	// crash mid-resume re-drives as a plain prompt rather than resuming
+	// into a transcript whose tail may no longer be a tool result.
+	pendingResume := sub.PendingResume
+	sub.PendingResume = false
 	s.subs[sub.ID] = sub
+	sub.PendingResume = pendingResume
 	return sub, nil
 }
 
@@ -306,7 +313,6 @@ func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error
 		return harness.ErrClaimLost
 	}
 	sub.Status = harness.StatusQueued
-	sub.PendingResume = false
 	sub.WaitUntil = time.Time{}
 	s.subs[sub.ID] = sub
 	return nil

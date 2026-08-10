@@ -454,38 +454,66 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
 		return fmt.Errorf("finalize settlement: %w", err)
 	}
+	if sub.ParentSubmissionID != "" {
+		// Re-run the wake after finalization: a sibling settling
+		// concurrently may have seen this submission still terminalizing
+		// and skipped the requeue. Whichever child finalizes last sees
+		// every sibling settled, so exactly one post-finalize wake
+		// requeues the parent. Idempotent — the outcome record exists by
+		// now, and a duplicate ResumeSubmission loses its CAS.
+		if err := c.wakeParent(ctx, sub, payload); err != nil {
+			return fmt.Errorf("wake parent after finalize: %w", err)
+		}
+	}
 	return nil
 }
 
 // appendSettledRecordOnce appends the submission_settled record unless one
 // already exists for the submission — the idempotency half of two-phase
-// settlement.
+// settlement. When the settling submission has a parent link, the wake
+// (HARNESS-15 settlement hand-off) runs inside the same reservation,
+// honoring an existing settled record's payload over the caller's (a
+// crash-recovery replay passes the indeterminate failure even when the
+// run's real outcome landed before the crash).
 func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) error {
 	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
 	if err != nil {
 		return fmt.Errorf("read records before settle: %w", err)
 	}
+	effective := payload
+	found := false
 	for _, rec := range recs {
 		if rec.Kind == KindSubmissionSettled && rec.SubmissionID == sub.ID {
-			return nil
+			found = true
+			if err := rec.DecodePayload(&effective); err != nil {
+				return fmt.Errorf("decode existing settled record: %w", err)
+			}
+			break
 		}
 	}
-	rec := Record{
-		RecordEnvelope: RecordEnvelope{
-			ID:             newULID(),
-			Kind:           KindSubmissionSettled,
-			ConversationID: sub.ConversationID,
-			Session:        sub.SessionKey.Session,
-			SubmissionID:   sub.ID,
-			AttemptID:      sub.AttemptID,
-			Time:           time.Now(),
-		},
-		Payload: mustPayload(&payload),
+	if !found {
+		rec := Record{
+			RecordEnvelope: RecordEnvelope{
+				ID:             newULID(),
+				Kind:           KindSubmissionSettled,
+				ConversationID: sub.ConversationID,
+				Session:        sub.SessionKey.Session,
+				SubmissionID:   sub.ID,
+				AttemptID:      sub.AttemptID,
+				Time:           time.Now(),
+			},
+			Payload: mustPayload(&payload),
+		}
+		if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
+			return fmt.Errorf("append settled record: %w", err)
+		}
+		c.rt.notifyAppend()
 	}
-	if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
-		return fmt.Errorf("append settled record: %w", err)
+	if sub.ParentSubmissionID != "" {
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
+			return fmt.Errorf("wake parent: %w", err)
+		}
 	}
-	c.rt.notifyAppend()
 	return nil
 }
 
@@ -654,7 +682,20 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	r.rt.registerLiveRun(r.conv.Key, agent)
 	defer r.rt.unregisterLiveRun(r.conv.Key)
 
-	if err := r.runRecovered(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
+	// A submission claimed with PendingResume was woken from a suspension
+	// (HARNESS-15): the wake landed the pending call's tool_outcome before
+	// the requeue, so the transcript tail is a tool result and the drive
+	// Resumes instead of re-prompting the input. A resumed turn can suspend
+	// again (more children) — the suspended flag propagates as on a prompt
+	// drive.
+	if r.sub.PendingResume {
+		err = r.runRecovered(ctx, agent, r.runResume)
+	} else {
+		err = r.runRecovered(ctx, agent, func(c context.Context, a *pi.Agent) error {
+			return r.runPrompt(c, a, inputToMessage(r.sub.Input))
+		})
+	}
+	if err != nil {
 		return err
 	}
 	if r.suspended {
@@ -678,18 +719,24 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	return nil
 }
 
-// runRecovered is the turn-recovery ladder around one prompt: context
-// overflow compacts and retries under a small budget; other stream errors
-// are classified fatal (llm.ErrProviderFatal) or transient (budgeted
+// runRecovered is the turn-recovery ladder around one prompt or resume:
+// context overflow compacts and retries under a small budget; other stream
+// errors are classified fatal (llm.ErrProviderFatal) or transient (budgeted
 // backoff via a fresh attempt).
-func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
+func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, promptFn func(context.Context, *pi.Agent) error) error {
 	compactions := 0
 	for {
-		err := r.runPrompt(ctx, agent, msg)
+		err := promptFn(ctx, agent)
 		if err == nil {
 			return nil
 		}
 		if errors.Is(err, errDeadlineHalted) || ctx.Err() != nil {
+			return err
+		}
+		if errors.Is(err, pi.ErrNothingToResume) {
+			// The wake lands the outcome before requeueing, so a resume
+			// drive always finds a tool-result tail; a miss signals a
+			// wake-ordering bug — fail the attempt, never retry it.
 			return err
 		}
 		if errors.Is(llm.AsContextOverflow(err), llm.ErrContextOverflow) {
@@ -819,6 +866,33 @@ func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, msg pi.M
 	return err
 }
 
+// runResume runs one resume operation on the agent — the re-drive of a
+// woken suspension (HARNESS-15) — wrapped in the OpOperation interceptor
+// boundary and bounded by operation events exactly like runPrompt.
+func (r *submissionRun) runResume(ctx context.Context, agent *pi.Agent) error {
+	corr := r.correlation()
+	r.rt.observe(OperationStartedEvent{Correlation: corr, Operation: "resume"})
+	err := r.rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "resume", Correlation: corr}, func(c context.Context) error {
+		return r.resumeOnce(c, agent)
+	})
+	r.rt.observe(OperationEndedEvent{Correlation: r.correlation(), Operation: "resume", Err: errString(err)})
+	return err
+}
+
+// resumeOnce is the unwrapped resume body: agent.Resume continues from the
+// transcript without appending input, so a wake re-drive lands no second
+// user_message. ErrNothingToResume propagates (runRecovered fails the
+// attempt on it).
+func (r *submissionRun) resumeOnce(ctx context.Context, agent *pi.Agent) error {
+	stream, err := agent.Resume(ctx, pi.PromptOpts{
+		SessionID: pi.SessionID(r.conv.ID),
+	})
+	if err != nil {
+		return fmt.Errorf("start resume: %w", err)
+	}
+	return r.consumeStream(ctx, agent, "resume", stream)
+}
+
 // promptOnce is the unwrapped prompt body.
 func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
 	stream, err := agent.Prompt(ctx, msg, pi.PromptOpts{
@@ -827,7 +901,12 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	if err != nil {
 		return fmt.Errorf("start prompt: %w", err)
 	}
+	return r.consumeStream(ctx, agent, "prompt", stream)
+}
 
+// consumeStream drains one prompt or resume stream into canonical records
+// and maps the terminal result: halt, interruption, suspension.
+func (r *submissionRun) consumeStream(ctx context.Context, agent *pi.Agent, op string, stream *pi.EventStream) error {
 	for ev := range stream.Events {
 		if err := r.consumeEvent(ctx, ev); err != nil {
 			// Record authoring must not lose events silently; stop the run.
@@ -840,7 +919,7 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	}
 	result := <-stream.Done
 	if result.Err != nil {
-		return fmt.Errorf("prompt: %w", result.Err)
+		return fmt.Errorf("%s: %w", op, result.Err)
 	}
 	r.mu.Lock()
 	halted := r.halted

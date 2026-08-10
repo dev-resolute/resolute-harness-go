@@ -463,7 +463,9 @@ func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
 		t.Fatalf("expired leases with waiting head = %v, want none (wait released the lease)", keys(ids(expired)))
 	}
 
-	// A wake requeues the submission and clears the wait markers.
+	// A wake requeues the submission and clears the wait bound; PendingResume
+	// survives the requeue — the claim that re-drives the submission
+	// consumes it (the drive branches Resume vs Prompt on the claimed row).
 	if err := s.ResumeSubmission(ctx, sub.ID); err != nil {
 		t.Fatalf("ResumeSubmission: %v", err)
 	}
@@ -474,8 +476,11 @@ func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
 	if got.Status != harness.StatusQueued {
 		t.Fatalf("resumed status = %q, want queued", got.Status)
 	}
-	if got.PendingResume || !got.WaitUntil.IsZero() {
-		t.Fatalf("resumed submission still marked: PendingResume=%v WaitUntil=%v", got.PendingResume, got.WaitUntil)
+	if !got.PendingResume {
+		t.Fatal("resumed submission lost PendingResume before the claim consumed it")
+	}
+	if !got.WaitUntil.IsZero() {
+		t.Fatalf("resumed submission still wait-bounded: WaitUntil=%v", got.WaitUntil)
 	}
 	runnable, err = s.ListRunnable(ctx)
 	if err != nil {
@@ -488,6 +493,20 @@ func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
 	// Resuming a non-waiting submission loses the CAS.
 	if err := s.ResumeSubmission(ctx, sub.ID); !errors.Is(err, harness.ErrClaimLost) {
 		t.Fatalf("resume of queued error = %v, want ErrClaimLost", err)
+	}
+
+	// The claim consumes PendingResume: the claimed row carries it (the
+	// drive branches on it), the stored row clears it.
+	claimed := claim(t, s, got)
+	if !claimed.PendingResume {
+		t.Fatal("claimed row lost PendingResume; the resume drive cannot branch on it")
+	}
+	got, err = s.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.PendingResume {
+		t.Fatal("stored row still marked PendingResume after the claim consumed it")
 	}
 }
 

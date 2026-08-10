@@ -409,9 +409,16 @@ func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatu
 // ClaimSubmission implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
 func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionClaim) (harness.Submission, error) {
+	// Capture PendingResume before the claim consumes it: the returned row
+	// carries it so the drive branches Resume vs Prompt on it; the stored
+	// row clears it (see the memory store for the rationale).
+	var pendingResume bool
+	if err := s.db.QueryRowContext(ctx, `SELECT pending_resume FROM submissions WHERE id = ?`, claim.SubmissionID).Scan(&pendingResume); err != nil {
+		return harness.Submission{}, fmt.Errorf("read pending resume for claim %s: %w", claim.SubmissionID, err)
+	}
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'running', attempt_id = ?, owner_id = ?,
-			lease_expires_ns = ?, attempt_count = attempt_count + 1
+			lease_expires_ns = ?, attempt_count = attempt_count + 1, pending_resume = 0
 		WHERE id = ? AND status = 'queued'`,
 		claim.AttemptID, claim.OwnerID, claim.LeaseExpiresAt.UnixNano(), claim.SubmissionID)
 	if err != nil {
@@ -420,7 +427,12 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	if err := casApplied(res, s.submissionExists(ctx, claim.SubmissionID)); err != nil {
 		return harness.Submission{}, err
 	}
-	return s.GetSubmission(ctx, claim.SubmissionID)
+	sub, err := s.GetSubmission(ctx, claim.SubmissionID)
+	if err != nil {
+		return harness.Submission{}, err
+	}
+	sub.PendingResume = pendingResume
+	return sub, nil
 }
 
 // casApplied maps a zero-row UPDATE to the right sentinel: the submission is
@@ -550,7 +562,7 @@ func (s *Store) WaitSubmission(ctx context.Context, wait harness.SubmissionWait)
 // are specified on the contract and pinned by the conformance suite.
 func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error {
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE submissions SET status = 'queued', pending_resume = 0, wait_until_ns = 0
+		UPDATE submissions SET status = 'queued', wait_until_ns = 0
 		WHERE id = ? AND status = 'waiting'`,
 		submissionID)
 	if err != nil {

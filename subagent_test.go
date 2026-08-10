@@ -25,6 +25,10 @@ import (
 type scriptProvider struct {
 	name   string
 	script [][]llm.LLMEvent
+	// gates optionally holds the Stream for step i until gates[i] closes
+	// (nil = ungated) — the test holds a run mid-flight while asserting
+	// parked state, keeping wake/park ordering deterministic (HARNESS-15).
+	gates []<-chan struct{}
 
 	mu   sync.Mutex
 	reqs []llm.LLMRequest
@@ -46,6 +50,14 @@ func (p *scriptProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.Eve
 	done := make(chan llm.StreamResult, 1)
 	go func() {
 		defer close(events)
+		if step < len(p.gates) && p.gates[step] != nil {
+			select {
+			case <-p.gates[step]:
+			case <-ctx.Done():
+				done <- llm.StreamResult{Err: context.Cause(ctx)}
+				return
+			}
+		}
 		if step >= len(p.script) {
 			done <- llm.StreamResult{Err: fmt.Errorf("scriptProvider %q: unexpected call #%d: %w", p.name, step+1, llm.ErrProviderFatal)}
 			return
@@ -219,12 +231,14 @@ func assertCallSpawnAdjacency(t *testing.T, recs []harness.Record) {
 func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		taskCallTurn("call-1", "reviewer", "check it"),
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -236,7 +250,9 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 		t.Fatalf("Dispatch: %v", err)
 	}
 
-	// The parent suspends: waiting, never settled.
+	// The parent suspends: waiting, never settled. The child is gated
+	// mid-run, so it cannot settle (and wake the parent) before the parked
+	// state is asserted.
 	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
 
 	// The injected tool reached the model with its routing metadata.
@@ -274,15 +290,6 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 	}
 	if want := parentSub.ID + ":" + safeCallID("call-1"); childSub.ID != want {
 		t.Errorf("child dispatch id = %q, want %q", childSub.ID, want)
-	}
-
-	// The child runs as an ordinary submission and settles.
-	settled, err := rt.Wait(ctx, childSub.ID)
-	if err != nil {
-		t.Fatalf("Wait(child): %v", err)
-	}
-	if settled.Status != harness.SettledSucceeded {
-		t.Fatalf("child settled = %+v, want succeeded", settled)
 	}
 
 	// Parent log: assistant_tool_call immediately followed by task_spawned;
@@ -343,13 +350,23 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 		t.Errorf("ParentRef.SpawnRecordID = %q, want spawn record id %q", created.ParentRef.SpawnRecordID, recs[spawnIdx].ID)
 	}
 
-	// The wake is Task 9: with the child settled the parent stays parked.
-	again, err := store.GetSubmission(ctx, parentSub.ID)
+	// Release the child: it settles, the wake lands the parent's outcome and
+	// requeues the parent, whose resume drive settles it (wake_test.go pins
+	// the wake itself).
+	close(childGate)
+	settled, err := rt.Wait(ctx, childSub.ID)
 	if err != nil {
-		t.Fatalf("GetSubmission(parent): %v", err)
+		t.Fatalf("Wait(child): %v", err)
 	}
-	if again.Status != harness.StatusWaiting {
-		t.Errorf("parent status after child settle = %s, want waiting", again.Status)
+	if settled.Status != harness.SettledSucceeded {
+		t.Fatalf("child settled = %+v, want succeeded", settled)
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
 	}
 }
 
@@ -359,6 +376,7 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 func TestTaskToolAdmissionIdempotent(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	args := taskArgs("reviewer", "check it")
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		{
@@ -368,10 +386,11 @@ func TestTaskToolAdmissionIdempotent(t *testing.T) {
 			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "task", Args: args},
 			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
 		},
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -391,9 +410,6 @@ func TestTaskToolAdmissionIdempotent(t *testing.T) {
 	if len(children) != 1 {
 		t.Fatalf("children = %d, want exactly 1 after a replayed callID", len(children))
 	}
-	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
-		t.Fatalf("Wait(child): %v", err)
-	}
 
 	recs, err := rt.Records(ctx, res.ConversationID, "")
 	if err != nil {
@@ -406,6 +422,20 @@ func TestTaskToolAdmissionIdempotent(t *testing.T) {
 	if n := countKind(recs, harness.KindToolOutcome); n != 0 {
 		t.Fatalf("tool_outcome records = %d, want 0 (both calls suspended)", n)
 	}
+
+	// Release the child: the wake requeues the parent, whose resume drive
+	// settles it.
+	close(childGate)
+	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
+	}
 }
 
 // A replayed callID whose child is still live must NOT count against the
@@ -414,6 +444,7 @@ func TestTaskToolAdmissionIdempotent(t *testing.T) {
 func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	args := taskArgs("reviewer", "check it")
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		{
@@ -421,10 +452,11 @@ func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
 			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "task", Args: args},
 			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
 		},
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{MaxChildrenPerRun: 1}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -444,9 +476,6 @@ func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
 	if len(children) != 1 {
 		t.Fatalf("children = %d, want exactly 1 after a replayed callID under MaxChildrenPerRun=1", len(children))
 	}
-	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
-		t.Fatalf("Wait(child): %v", err)
-	}
 
 	recs, err := rt.Records(ctx, res.ConversationID, "")
 	if err != nil {
@@ -459,6 +488,20 @@ func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
 	if n := countKind(recs, harness.KindToolOutcome); n != 0 {
 		t.Fatalf("tool_outcome records = %d, want 0 — the replay must not error against the bound", n)
 	}
+
+	// Release the child: the wake requeues the parent, whose resume drive
+	// settles it.
+	close(childGate)
+	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
+	}
 }
 
 // A provider-controlled callID is sanitized before it flows into the child
@@ -467,12 +510,14 @@ func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
 func TestTaskToolSanitizesCallID(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		taskCallTurn("call/1?x y", "reviewer", "check it"),
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -524,6 +569,20 @@ func TestTaskToolSanitizesCallID(t *testing.T) {
 	}
 	if want := "acme:" + safeCallID("call/1?x y"); spawn.ChildInstance != want {
 		t.Errorf("spawn ChildInstance = %q, want %q (sanitized callID)", spawn.ChildInstance, want)
+	}
+
+	// Release the child: the wake correlates on the RAW callID (the child
+	// row's ParentCallID), lands the outcome, and requeues the parent.
+	close(childGate)
+	if _, err := rt.Wait(ctx, childSub.ID); err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
 	}
 }
 
@@ -668,16 +727,18 @@ func TestTaskToolRejectsStrangers(t *testing.T) {
 func TestTaskToolRejectsOverflow(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		{
 			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "task", Args: taskArgs("reviewer", "first")},
 			llm.ToolCallEndEvent{CallID: "call-2", ToolName: "task", Args: taskArgs("reviewer", "second")},
 			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
 		},
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{MaxChildrenPerRun: 1}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -698,9 +759,6 @@ func TestTaskToolRejectsOverflow(t *testing.T) {
 	}
 	if len(children) != 1 {
 		t.Fatalf("children = %d, want exactly 1 under MaxChildrenPerRun=1", len(children))
-	}
-	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
-		t.Fatalf("Wait(child): %v", err)
 	}
 
 	recs, err := rt.Records(ctx, res.ConversationID, "")
@@ -726,6 +784,20 @@ func TestTaskToolRejectsOverflow(t *testing.T) {
 	}
 	if outcome.CallID == children[0].ParentCallID {
 		t.Errorf("overflow outcome CallID = %q, the call that admitted the child; want the other call", outcome.CallID)
+	}
+
+	// Release the child: the wake lands the admitted call's outcome (the
+	// overflow outcome already landed in-turn) and requeues the parent.
+	close(childGate)
+	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
 	}
 }
 
@@ -800,17 +872,19 @@ func TestNoPolicyNoTaskTool(t *testing.T) {
 func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		{
 			llm.ToolCallEndEvent{CallID: "call/1", ToolName: "task", Args: taskArgs("reviewer", "first")},
 			llm.ToolCallEndEvent{CallID: "call?1", ToolName: "task", Args: taskArgs("reviewer", "second")},
 			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
 		},
+		textTurn("both back"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("first done"),
 		textTurn("second done"),
-	}}
+	}, gates: []<-chan struct{}{nil, childGate}}
 	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -839,11 +913,6 @@ func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
 			t.Errorf("no child with dispatch id %q (raw callID %q)", want, raw)
 		}
 	}
-	for _, ch := range children {
-		if _, err := rt.Wait(ctx, ch.ID); err != nil {
-			t.Fatalf("Wait(child %s): %v", ch.ID, err)
-		}
-	}
 
 	recs, err := rt.Records(ctx, res.ConversationID, "")
 	if err != nil {
@@ -853,6 +922,22 @@ func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
 		t.Fatalf("task_spawned records = %d, want 2", n)
 	}
 	assertCallSpawnAdjacency(t, recs)
+
+	// Release the gated child: the first settle does not requeue (a sibling
+	// is still in flight); the second does, and the parent settles.
+	close(childGate)
+	for _, ch := range children {
+		if _, err := rt.Wait(ctx, ch.ID); err != nil {
+			t.Fatalf("Wait(child %s): %v", ch.ID, err)
+		}
+	}
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
+	}
 }
 
 // A ToolCallEndEvent lost to agent-core's lossy event channel (dropped
@@ -864,15 +949,17 @@ func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
 func TestTaskToolDroppedSpawnEventReconciledAtParkTime(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
+	childGate := make(chan struct{})
 	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		{
 			llm.ToolCallEndEvent{CallID: "dropped-call", ToolName: "task", Args: json.RawMessage(`{}`)},
 			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
 		},
+		textTurn("triage done"),
 	}}
 	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
 		textTurn("looks good"),
-	}}
+	}, gates: []<-chan struct{}{childGate}}
 
 	// The rig simulates the drop: the tool admits the child synchronously
 	// (Dispatch writes the parent link and the child conversation's
@@ -994,8 +1081,11 @@ func TestTaskToolDroppedSpawnEventReconciledAtParkTime(t *testing.T) {
 		t.Errorf("reconciled task_spawned payload = %+v, want %+v", spawn, wantSpawn)
 	}
 
-	// The child runs and settles; the parent stays parked (the wake is
-	// Task 9).
+	// Release the child: it settles, the wake lands the parent's outcome
+	// (correlated via the durable child row — the reconciled spawn record
+	// is not the correlation source) and requeues the parent, whose resume
+	// drive settles it.
+	close(childGate)
 	settled, err := rt.Wait(ctx, rig.child.SubmissionID)
 	if err != nil {
 		t.Fatalf("Wait(child): %v", err)
@@ -1003,11 +1093,11 @@ func TestTaskToolDroppedSpawnEventReconciledAtParkTime(t *testing.T) {
 	if settled.Status != harness.SettledSucceeded {
 		t.Fatalf("child settled = %+v, want succeeded", settled)
 	}
-	again, err := store.GetSubmission(ctx, parentSub.ID)
+	parentSettled, err := rt.Wait(ctx, parentSub.ID)
 	if err != nil {
-		t.Fatalf("GetSubmission(parent): %v", err)
+		t.Fatalf("Wait(parent): %v", err)
 	}
-	if again.Status != harness.StatusWaiting {
-		t.Errorf("parent status after child settle = %s, want waiting", again.Status)
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Errorf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
 	}
 }
