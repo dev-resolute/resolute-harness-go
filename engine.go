@@ -351,8 +351,13 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 			AttemptID:    sub.AttemptID,
 			WaitUntil:    c.rt.waitDeadline(),
 		}); err != nil {
-			// Lost the race with a reclaimer; abandon the attempt.
-			logger.Warn("wait transition lost; abandoning attempt", "error", err)
+			if errors.Is(err, ErrClaimLost) {
+				// Lost the race with a reclaimer; abandon the attempt.
+				logger.Warn("wait transition lost; abandoning attempt", "error", err)
+				return
+			}
+			// The submission stays running; it recovers via lease expiry.
+			logger.Error("wait transition failed; submission stays running and recovers via lease expiry", "error", err)
 			return
 		}
 		// Task 12: emit SubmissionWaitingEvent
@@ -508,8 +513,17 @@ type submissionRun struct {
 
 	// suspended reports the prompt ended on a Suspend-marked task call
 	// (HARNESS-15); the attempt parks the submission in waiting instead of
-	// settling it.
+	// settling it. Single-goroutine invariant: written in promptOnce and
+	// read in drive/driveAttempt, all on the drive goroutine — unlike the
+	// mutex-guarded fields above it needs no lock.
 	suspended bool
+
+	// pendingSpawns counts the task_spawned records resolved for this
+	// attempt (authored by the consumer, or already durable from a prior
+	// admission). It gates suspended: a bare Suspend result with no spawn
+	// record must settle normally, never park (HARNESS-15 review). Same
+	// single-goroutine invariant as suspended.
+	pendingSpawns int
 
 	// Pending delta batch (accessed only from the event-consuming goroutine).
 	deltaKind    RecordKind
@@ -822,7 +836,9 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	if ctx.Err() != nil {
 		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
 	}
-	if result.Suspended {
+	if result.Suspended && r.pendingSpawns > 0 {
+		// Park only when at least one task_spawned record resolved this
+		// attempt; a bare Suspend (no spawn data) settles normally.
 		r.suspended = true
 	}
 	return nil
@@ -940,11 +956,40 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 			return err
 		}
 		if e.Result.Suspend {
-			// A suspended call resolves externally (HARNESS-15's task
-			// tool): no outcome is authored now — the pending call is the
-			// suspension point. The wake authors the outcome on child
-			// settlement.
-			return nil
+			// A suspended task call carries its spawn payload in Data
+			// (HARNESS-15). Author the task_spawned record HERE, on the
+			// consumer goroutine, so it lands after the
+			// assistant_tool_call record by construction. No outcome is
+			// authored — the pending call is the suspension point; the
+			// wake authors the outcome on child settlement.
+			var sd spawnData
+			if err := json.Unmarshal(e.Result.Data, &sd); err == nil && sd.SpawnRecordID != "" {
+				exists, err := r.spawnRecordExists(ctx, sd.CallID)
+				if err != nil {
+					return err
+				}
+				if !exists {
+					rec := r.record(KindTaskSpawned, &TaskSpawnedPayload{
+						CallID:              sd.CallID,
+						Agent:               sd.Agent,
+						ChildInstance:       sd.ChildInstance,
+						ChildConversationID: sd.ChildConversationID,
+						ChildSubmissionID:   sd.ChildSubmissionID,
+						Prompt:              sd.Prompt,
+					})
+					rec.ID = sd.SpawnRecordID
+					if err := r.append(ctx, rec); err != nil {
+						return err
+					}
+				}
+				r.pendingSpawns++
+				return nil
+			}
+			// A Suspend result without spawn data is not a task
+			// suspension: author the outcome as if Suspend were unset so
+			// the submission settles normally instead of parking forever.
+			r.rt.logger.Warn("suspend result without spawn data; authoring outcome normally",
+				"submission", r.sub.ID, "callId", e.CallID, "tool", e.ToolName)
 		}
 		rec := r.record(KindToolOutcome, &ToolOutcomePayload{
 			CallID:   e.CallID,

@@ -145,6 +145,36 @@ func findRecord(recs []harness.Record, kind harness.RecordKind) int {
 	return -1
 }
 
+// assertCallSpawnAdjacency pins the call→spawn ordering strictly: every
+// task_spawned record immediately follows the LAST assistant_tool_call
+// carrying its CallID — never before it, never with an intervening record.
+func assertCallSpawnAdjacency(t *testing.T, recs []harness.Record) {
+	t.Helper()
+	lastCall := map[string]int{}
+	for i, rec := range recs {
+		switch rec.Kind {
+		case harness.KindAssistantToolCall:
+			var p harness.AssistantToolCallPayload
+			if err := rec.DecodePayload(&p); err != nil {
+				t.Fatalf("DecodePayload(assistant_tool_call): %v", err)
+			}
+			lastCall[p.CallID] = i
+		case harness.KindTaskSpawned:
+			var p harness.TaskSpawnedPayload
+			if err := rec.DecodePayload(&p); err != nil {
+				t.Fatalf("DecodePayload(task_spawned): %v", err)
+			}
+			callIdx, ok := lastCall[p.CallID]
+			if !ok {
+				t.Fatalf("task_spawned at %d has no preceding assistant_tool_call for %q", i, p.CallID)
+			}
+			if i != callIdx+1 {
+				t.Fatalf("task_spawned for %q at %d, want immediately after its call at %d", p.CallID, i, callIdx)
+			}
+		}
+	}
+}
+
 // A task call on an allowed target admits exactly one durable child, lands
 // the task_spawned record immediately after the call, and parks the parent
 // in waiting — no tool outcome, no settlement.
@@ -231,6 +261,7 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 	if callIdx < 0 || spawnIdx != callIdx+1 {
 		t.Fatalf("record order: call at %d, spawn at %d, want spawn immediately after call", callIdx, spawnIdx)
 	}
+	assertCallSpawnAdjacency(t, recs)
 	if n := countKind(recs, harness.KindToolOutcome); n != 0 {
 		t.Fatalf("tool_outcome records = %d, want 0 while the child is unsettled", n)
 	}
@@ -333,8 +364,200 @@ func TestTaskToolAdmissionIdempotent(t *testing.T) {
 	if n := countKind(recs, harness.KindTaskSpawned); n != 1 {
 		t.Fatalf("task_spawned records = %d, want exactly 1", n)
 	}
+	assertCallSpawnAdjacency(t, recs)
 	if n := countKind(recs, harness.KindToolOutcome); n != 0 {
 		t.Fatalf("tool_outcome records = %d, want 0 (both calls suspended)", n)
+	}
+}
+
+// A replayed callID whose child is still live must NOT count against the
+// fan-out bound: two identical in-turn calls under MaxChildrenPerRun=1
+// admit one child, land one spawn record, and produce no error outcome.
+func TestTaskToolReplaySkipsFanOutBound(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	args := taskArgs("reviewer", "check it")
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		{
+			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "task", Args: args},
+			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "task", Args: args},
+			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
+		},
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}}
+	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{MaxChildrenPerRun: 1}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+
+	children, err := store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d, want exactly 1 after a replayed callID under MaxChildrenPerRun=1", len(children))
+	}
+	if _, err := rt.Wait(ctx, children[0].ID); err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records(parent): %v", err)
+	}
+	if n := countKind(recs, harness.KindTaskSpawned); n != 1 {
+		t.Fatalf("task_spawned records = %d, want exactly 1", n)
+	}
+	assertCallSpawnAdjacency(t, recs)
+	if n := countKind(recs, harness.KindToolOutcome); n != 0 {
+		t.Fatalf("tool_outcome records = %d, want 0 — the replay must not error against the bound", n)
+	}
+}
+
+// A provider-controlled callID is sanitized before it flows into the child
+// Instance (a URL path segment), Session, and DispatchID; the raw callID
+// still names the call in the spawn record and the parent link.
+func TestTaskToolSanitizesCallID(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		taskCallTurn("call/1?x y", "reviewer", "check it"),
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}}
+	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+
+	children, err := store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d, want 1", len(children))
+	}
+	childSub := children[0]
+	if want := "acme:call-1-x-y"; string(childSub.SessionKey.Instance) != want {
+		t.Errorf("child instance = %q, want %q (sanitized callID)", childSub.SessionKey.Instance, want)
+	}
+	if want := "task-call-1-x-y"; childSub.SessionKey.Session != want {
+		t.Errorf("child session = %q, want %q (sanitized callID)", childSub.SessionKey.Session, want)
+	}
+	if want := parentSub.ID + ":call-1-x-y"; childSub.ID != want {
+		t.Errorf("child dispatch id = %q, want %q (sanitized callID)", childSub.ID, want)
+	}
+	if childSub.ParentCallID != "call/1?x y" {
+		t.Errorf("child parent link CallID = %q, want the raw callID", childSub.ParentCallID)
+	}
+
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records(parent): %v", err)
+	}
+	spawnIdx := findRecord(recs, harness.KindTaskSpawned)
+	if spawnIdx < 0 {
+		t.Fatal("no task_spawned record")
+	}
+	assertCallSpawnAdjacency(t, recs)
+	var spawn harness.TaskSpawnedPayload
+	if err := recs[spawnIdx].DecodePayload(&spawn); err != nil {
+		t.Fatalf("DecodePayload(task_spawned): %v", err)
+	}
+	if spawn.CallID != "call/1?x y" {
+		t.Errorf("spawn CallID = %q, want the raw callID (wake correlates on it)", spawn.CallID)
+	}
+	if want := "acme:call-1-x-y"; spawn.ChildInstance != want {
+		t.Errorf("spawn ChildInstance = %q, want %q (sanitized callID)", spawn.ChildInstance, want)
+	}
+}
+
+// A Suspend result WITHOUT spawn data (a non-task tool) is not a
+// suspension: the outcome is authored as if Suspend were unset and the
+// submission settles normally — it must never park in waiting.
+func TestBareSuspendWithoutSpawnDataSettlesNormally(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	provider := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		{
+			llm.ToolCallEndEvent{CallID: "call-1", ToolName: "park", Args: json.RawMessage(`{}`)},
+			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
+		},
+	}}
+	park := pi.NewTool(pi.Tool[struct{}]{
+		Name: "park", Description: "returns a bare suspend result",
+		Execute: func(ctx context.Context, p struct{}) (pi.ToolResult, error) {
+			return pi.ToolResult{Suspend: true, Content: "parked"}, nil
+		},
+	})
+	rt := startRuntime(t, harness.Config{
+		Agents: map[string]harness.AgentDefinition{
+			"lonely": {
+				Initialize: func(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
+					return harness.AgentRuntimeConfig{
+						Model:         "mock/test-model",
+						ContextWindow: 200_000,
+						Providers:     []llm.LLMProvider{provider},
+						Tools:         []pi.RegisteredTool{park},
+					}, nil
+				},
+			},
+		},
+		Store:         store,
+		ClaimInterval: 20 * time.Millisecond,
+		LeaseDuration: 300 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "lonely", Instance: "acme", Message: harness.UserMessage("work alone"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	settled, err := rt.Wait(ctx, res.SubmissionID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if settled.Status != harness.SettledSucceeded {
+		t.Fatalf("settled = %+v, want succeeded — a bare Suspend must not park the submission", settled)
+	}
+
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if n := countKind(recs, harness.KindTaskSpawned); n != 0 {
+		t.Fatalf("task_spawned records = %d, want 0 for a non-task tool", n)
+	}
+	outcomeIdx := findRecord(recs, harness.KindToolOutcome)
+	if outcomeIdx < 0 {
+		t.Fatal("no tool_outcome — a bare Suspend must be authored as if Suspend were unset")
+	}
+	var outcome harness.ToolOutcomePayload
+	if err := recs[outcomeIdx].DecodePayload(&outcome); err != nil {
+		t.Fatalf("DecodePayload(tool_outcome): %v", err)
+	}
+	if outcome.CallID != "call-1" || outcome.Content != "parked" {
+		t.Errorf("outcome = %+v, want the bare-suspend result authored normally", outcome)
 	}
 }
 
