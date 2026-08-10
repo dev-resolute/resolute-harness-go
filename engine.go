@@ -39,6 +39,11 @@ var errDeadlineHalted = errors.New("durability timeout reached mid-run")
 // upstream #6285) — this string is not an upstream port.
 const danglingToolCallMessage = "Tool call was interrupted before a result was recorded (the run was recovered). Re-issue the tool call if it is still needed."
 
+// waitExpiredMessage is the harness-owned error tool_outcome content for a
+// spawned task call whose parent's bounded wait lapsed before the child
+// settled (HARNESS-15 wait expiry).
+const waitExpiredMessage = "task wait expired"
+
 // overflowCompactRetries bounds the in-attempt overflow ladder: each
 // overflow triggers one compact-and-retry, at most this many times.
 const overflowCompactRetries = 2
@@ -77,6 +82,7 @@ func (c *coordinator) loop(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		c.reclaimExpired(ctx)
+		c.expireWaits(ctx)
 		c.claimRunnable(ctx)
 		select {
 		case <-ctx.Done():
@@ -165,6 +171,202 @@ func (c *coordinator) reclaimExpired(ctx context.Context) {
 			c.rt.logger.Info("reclaimed expired lease", "submission", sub.ID, "deadOwner", sub.OwnerID)
 		}
 	}
+}
+
+// expireWaits is the wait scan (HARNESS-15), run on the same tick as
+// reclaimExpired. Two passes over parked parents:
+//
+//   - Expiry: a waiting submission whose WaitUntil lapsed can no longer pay
+//     off — its live children are cancelled, an error tool_outcome lands
+//     per outstanding spawned call, and it is requeued so the re-drive sees
+//     the failure.
+//   - Backstop: a waiting submission whose children ALL settled but which
+//     still lacks an outcome for a spawned call lost its wake to a crash
+//     window — the wake is re-run (wakeParent is idempotent; it no-ops
+//     when the outcome exists).
+func (c *coordinator) expireWaits(ctx context.Context) {
+	expired, err := c.rt.store.ListExpiredWaits(ctx, time.Now())
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("list expired waits", "error", err)
+		}
+		return
+	}
+	for _, sub := range expired {
+		if err := c.expireWait(ctx, sub); err != nil {
+			c.rt.logger.Error("expire wait", "submission", sub.ID, "error", err)
+		}
+	}
+
+	waiting, err := c.rt.store.ListByStatus(ctx, StatusWaiting)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("list waiting submissions", "error", err)
+		}
+		return
+	}
+	for _, sub := range waiting {
+		if err := c.backstopWake(ctx, sub); err != nil {
+			c.rt.logger.Error("backstop wake", "submission", sub.ID, "error", err)
+		}
+	}
+}
+
+// expireWait ends one lapsed wait: the children still in flight are
+// cancelled, each spawned call still lacking an outcome gets the
+// wait-expired error outcome, and the parent is requeued so its re-drive
+// sees the failure as the call's result. Cancelling a running child only
+// sets CancelRequested (the orphan cascade, Task 11, owns running-child
+// termination); either way the parent's outcome no longer waits on it.
+func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
+	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
+	if err != nil {
+		return fmt.Errorf("list children for wait expiry: %w", err)
+	}
+	for _, ch := range children {
+		if ch.Status == StatusSettled {
+			continue
+		}
+		if _, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent wait expired"); err != nil && !errors.Is(err, ErrClaimLost) {
+			return fmt.Errorf("cancel child %s for wait expiry: %w", ch.ID, err)
+		}
+	}
+
+	pending, err := c.pendingSpawnedCalls(ctx, sub)
+	if err != nil {
+		return err
+	}
+	if len(pending) > 0 {
+		outcomes := make([]Record, 0, len(pending))
+		for _, callID := range pending {
+			outcomes = append(outcomes, Record{
+				RecordEnvelope: RecordEnvelope{
+					ID:             newULID(),
+					Kind:           KindToolOutcome,
+					ConversationID: sub.ConversationID,
+					Session:        sub.SessionKey.Session,
+					SubmissionID:   sub.ID,
+					Time:           time.Now(),
+				},
+				Payload: mustPayload(&ToolOutcomePayload{
+					CallID:   callID,
+					ToolName: "task",
+					IsError:  true,
+					Content:  waitExpiredMessage,
+				}),
+			})
+		}
+		if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, outcomes); err != nil {
+			return fmt.Errorf("append wait-expiry outcomes: %w", err)
+		}
+		c.rt.notifyAppend()
+	}
+
+	if err := c.rt.store.ResumeSubmission(ctx, sub.ID); err != nil {
+		if errors.Is(err, ErrClaimLost) {
+			return nil // a wake already requeued it
+		}
+		return fmt.Errorf("requeue expired parent %s: %w", sub.ID, err)
+	}
+	// Nudge the claim loop without blocking (same as the wake).
+	select {
+	case c.rt.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// backstopWake re-runs the settlement wake for a waiting submission whose
+// children all settled but which still lacks the outcome for a spawned call
+// — the wake was lost to a crash window. wakeParent is idempotent, so a
+// submission whose outcomes all landed costs only the reads.
+func (c *coordinator) backstopWake(ctx context.Context, sub Submission) error {
+	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
+	if err != nil {
+		return fmt.Errorf("list children for wake backstop: %w", err)
+	}
+	if len(children) == 0 {
+		return nil
+	}
+	for _, ch := range children {
+		if ch.Status != StatusSettled {
+			return nil // still in flight — the wake fires at settlement
+		}
+	}
+	pending, err := c.pendingSpawnedCalls(ctx, sub)
+	if err != nil {
+		return err
+	}
+	for _, ch := range children {
+		if !slices.Contains(pending, ch.ParentCallID) {
+			continue
+		}
+		payload, err := c.settledPayload(ctx, ch)
+		if err != nil {
+			return err
+		}
+		if err := c.wakeParent(ctx, ch, payload); err != nil {
+			return fmt.Errorf("backstop wake for child %s: %w", ch.ID, err)
+		}
+	}
+	return nil
+}
+
+// pendingSpawnedCalls returns, in spawn-record order, the call IDs of the
+// conversation's task_spawned records that have no tool_outcome yet.
+func (c *coordinator) pendingSpawnedCalls(ctx context.Context, sub Submission) ([]string, error) {
+	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
+	if err != nil {
+		return nil, fmt.Errorf("read records for wait scan: %w", err)
+	}
+	answered := make(map[string]bool)
+	for _, rec := range recs {
+		if rec.Kind != KindToolOutcome {
+			continue
+		}
+		var p ToolOutcomePayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return nil, fmt.Errorf("decode tool_outcome for wait scan: %w", err)
+		}
+		answered[p.CallID] = true
+	}
+	var pending []string
+	seen := make(map[string]bool)
+	for _, rec := range recs {
+		if rec.Kind != KindTaskSpawned {
+			continue
+		}
+		var sp TaskSpawnedPayload
+		if err := rec.DecodePayload(&sp); err != nil {
+			return nil, fmt.Errorf("decode task_spawned for wait scan: %w", err)
+		}
+		if answered[sp.CallID] || seen[sp.CallID] {
+			continue
+		}
+		seen[sp.CallID] = true
+		pending = append(pending, sp.CallID)
+	}
+	return pending, nil
+}
+
+// settledPayload reads back the submission_settled record of an
+// already-settled submission — the payload a backstop wake replays.
+func (c *coordinator) settledPayload(ctx context.Context, sub Submission) (SettledPayload, error) {
+	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
+	if err != nil {
+		return SettledPayload{}, fmt.Errorf("read records for settled payload: %w", err)
+	}
+	for _, rec := range recs {
+		if rec.Kind != KindSubmissionSettled || rec.SubmissionID != sub.ID {
+			continue
+		}
+		var p SettledPayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return SettledPayload{}, fmt.Errorf("decode settled record: %w", err)
+		}
+		return p, nil
+	}
+	return SettledPayload{}, fmt.Errorf("settled submission %s has no settled record", sub.ID)
 }
 
 // claimRunnable claims every runnable submission whose session is not
@@ -825,6 +1027,36 @@ func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
 				return fmt.Errorf("decode tool_outcome for reconciliation: %w", err)
 			}
 			delete(pending, p.CallID)
+		}
+	}
+
+	// Suspension exemption (HARNESS-15): a spawned task call is
+	// intentionally outcome-less while its child runs — the wake authors
+	// the outcome at settlement. Subtract those calls so a re-driven
+	// parent never sees a fabricated error for a live child (which the
+	// wake's existing-outcome-wins check would then honor forever). A
+	// missing child row means the admission never landed — treat it as
+	// settled and let the call reconcile.
+	for _, rec := range recs {
+		if rec.Kind != KindTaskSpawned {
+			continue
+		}
+		var sp TaskSpawnedPayload
+		if err := rec.DecodePayload(&sp); err != nil {
+			return fmt.Errorf("decode task_spawned for reconciliation: %w", err)
+		}
+		if !pending[sp.CallID] {
+			continue
+		}
+		child, err := r.rt.store.GetSubmission(ctx, sp.ChildSubmissionID)
+		if err != nil {
+			if errors.Is(err, ErrSubmissionNotFound) {
+				continue
+			}
+			return fmt.Errorf("look up spawned child %s for reconciliation: %w", sp.ChildSubmissionID, err)
+		}
+		if child.Status != StatusSettled {
+			delete(pending, sp.CallID)
 		}
 	}
 	if len(pending) == 0 {
