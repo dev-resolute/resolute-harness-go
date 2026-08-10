@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -280,9 +281,10 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
 	var result json.RawMessage
+	var suspended bool
 	runErr := c.rt.intercept(runCtx, OpInfo{Kind: OpAttempt, Correlation: sub.correlation()}, func(cctx context.Context) error {
 		var derr error
-		result, derr = c.driveAttempt(cctx, sub, cfg, deadline)
+		result, suspended, derr = c.driveAttempt(cctx, sub, cfg, deadline)
 		return derr
 	})
 	cancelRun(nil)
@@ -340,6 +342,20 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status: SettledFailed, Error: runErr.Error(), ErrorCode: SettledErrRunFailed,
 		}, logger)
+	case suspended:
+		// The run suspended on a task call (HARNESS-15): park the
+		// submission in waiting — the lease is released and the worker
+		// freed — until a child settlement wakes it (Task 9).
+		if err := c.rt.store.WaitSubmission(ctx, SubmissionWait{
+			SubmissionID: sub.ID,
+			AttemptID:    sub.AttemptID,
+			WaitUntil:    c.rt.waitDeadline(),
+		}); err != nil {
+			// Lost the race with a reclaimer; abandon the attempt.
+			logger.Warn("wait transition lost; abandoning attempt", "error", err)
+			return
+		}
+		// Task 12: emit SubmissionWaitingEvent
 	default:
 		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded, Result: result}, logger)
 	}
@@ -393,11 +409,12 @@ func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, paylo
 }
 
 // driveAttempt runs the agent for one attempt, returning the validated
-// structured result (nil when none was requested) and the run error.
-func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) (json.RawMessage, error) {
+// structured result (nil when none was requested), whether the run
+// suspended on a task call, and the run error.
+func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) (json.RawMessage, bool, error) {
 	conv, err := c.rt.store.GetConversation(ctx, sub.SessionKey)
 	if err != nil {
-		return nil, fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
+		return nil, false, fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
 	}
 	run := &submissionRun{
 		rt:       c.rt,
@@ -407,9 +424,9 @@ func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg Agen
 		deadline: deadline,
 	}
 	if err := run.drive(ctx); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return run.result, nil
+	return run.result, run.suspended, nil
 }
 
 // settle runs two-phase settlement: reserve the terminal transition, land
@@ -488,6 +505,11 @@ type submissionRun struct {
 	// result is the validated structured result, set by drive when the
 	// prompt requested one.
 	result json.RawMessage
+
+	// suspended reports the prompt ended on a Suspend-marked task call
+	// (HARNESS-15); the attempt parks the submission in waiting instead of
+	// settling it.
+	suspended bool
 
 	// Pending delta batch (accessed only from the event-consuming goroutine).
 	deltaKind    RecordKind
@@ -573,11 +595,16 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		attemptID:    r.sub.AttemptID,
 		turnID:       r.currentTurnID,
 	}
+	tools := r.cfg.Tools
+	if targets := r.rt.subagentTargets(r.conv.Key.Agent, r.sub.Depth); len(targets) > 0 {
+		// Clone so the append cannot alias the definition's tool slice.
+		tools = append(slices.Clone(r.cfg.Tools), newTaskTool(r.rt, r, targets))
+	}
 	agent, err := pi.NewAgent(pi.AgentConfig{
 		Providers:          r.interceptedProviders(),
 		DefaultModel:       r.cfg.Model,
 		SystemPrompt:       r.cfg.SystemPrompt,
-		Tools:              r.interceptedTools(),
+		Tools:              r.interceptedTools(tools),
 		Skills:             r.cfg.Skills,
 		ReserveTokens:      r.cfg.ReserveTokens,
 		KeepRecentTokens:   r.cfg.KeepRecentTokens,
@@ -610,6 +637,11 @@ func (r *submissionRun) drive(ctx context.Context) error {
 
 	if err := r.runRecovered(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
 		return err
+	}
+	if r.suspended {
+		// Suspended on a task call: no final answer to validate this
+		// attempt.
+		return nil
 	}
 	if len(r.sub.Input.ResultSchema) > 0 {
 		return r.validateResultLoop(ctx, agent)
@@ -790,6 +822,9 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	if ctx.Err() != nil {
 		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
 	}
+	if result.Suspended {
+		r.suspended = true
+	}
 	return nil
 }
 
@@ -903,6 +938,13 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		r.rt.observe(ToolCallEndedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.ToolName, IsError: e.Result.IsError})
 		if err := r.flushDeltas(ctx); err != nil {
 			return err
+		}
+		if e.Result.Suspend {
+			// A suspended call resolves externally (HARNESS-15's task
+			// tool): no outcome is authored now — the pending call is the
+			// suspension point. The wake authors the outcome on child
+			// settlement.
+			return nil
 		}
 		rec := r.record(KindToolOutcome, &ToolOutcomePayload{
 			CallID:   e.CallID,
@@ -1045,13 +1087,13 @@ func (p *interceptedProvider) Stream(ctx context.Context, req llm.LLMRequest) ll
 }
 
 // interceptedTools wraps each registered tool so the OpTool interceptor
-// boundary covers every execution.
-func (r *submissionRun) interceptedTools() []pi.RegisteredTool {
-	if len(r.rt.interceptors) == 0 || len(r.cfg.Tools) == 0 {
-		return r.cfg.Tools
+// boundary covers every execution — including the injected task tool.
+func (r *submissionRun) interceptedTools(tools []pi.RegisteredTool) []pi.RegisteredTool {
+	if len(r.rt.interceptors) == 0 || len(tools) == 0 {
+		return tools
 	}
-	out := make([]pi.RegisteredTool, len(r.cfg.Tools))
-	for i, t := range r.cfg.Tools {
+	out := make([]pi.RegisteredTool, len(tools))
+	for i, t := range tools {
 		out[i] = &interceptedTool{inner: t, run: r}
 	}
 	return out

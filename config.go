@@ -99,7 +99,7 @@ type SubagentPolicy map[string][]string
 // documented defaults at NewRuntime.
 type SubagentLimits struct {
 	MaxChildrenPerRun int           // default 8; excess task calls → immediate error result
-	MaxDepth          int           // default 1; 0 disables the feature outright
+	MaxDepth          int           // default 1; the feature is off for agents with no SubagentPolicy entry
 	MaxWait           time.Duration // default 0 = unbounded wait
 	OnParentTerminal  OrphanPolicy  // default CancelChildren
 }
