@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"slices"
 	"strings"
 	"sync"
@@ -71,6 +72,25 @@ func (p *scriptProvider) requests() []llm.LLMRequest {
 // taskArgs builds the task tool's argument JSON.
 func taskArgs(agent, prompt string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"agent":%q,"prompt":%q}`, agent, prompt))
+}
+
+// safeCallID mirrors the harness's sanitizeCallID so tests can pin the
+// derived identifiers exactly: sanitize to [A-Za-z0-9_-], truncate to 48
+// bytes, mix in 8 hex chars of fnv32(raw).
+func safeCallID(raw string) string {
+	b := []byte(raw)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-' {
+			continue
+		}
+		b[i] = '-'
+	}
+	if len(b) > 48 {
+		b = b[:48]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(raw))
+	return fmt.Sprintf("%s-%08x", string(b), h.Sum32())
 }
 
 // taskCallTurn scripts a turn ending in a single task tool call.
@@ -145,12 +165,17 @@ func findRecord(recs []harness.Record, kind harness.RecordKind) int {
 	return -1
 }
 
-// assertCallSpawnAdjacency pins the call→spawn ordering strictly: every
-// task_spawned record immediately follows the LAST assistant_tool_call
-// carrying its CallID — never before it, never with an intervening record.
+// assertCallSpawnAdjacency pins the call→spawn ordering: every
+// task_spawned lands AFTER an assistant_tool_call carrying its CallID and
+// before any tool_outcome or second task_spawned for the same call.
+// Strict adjacency is NOT required — agent-core emits MessageEndEvent
+// before tool execution, so a text+task turn legitimately lands an
+// assistant_message_completed between the call and the spawn.
 func assertCallSpawnAdjacency(t *testing.T, recs []harness.Record) {
 	t.Helper()
-	lastCall := map[string]int{}
+	firstCall := map[string]int{}
+	spawned := map[string]int{}
+	outcome := map[string]int{}
 	for i, rec := range recs {
 		switch rec.Kind {
 		case harness.KindAssistantToolCall:
@@ -158,18 +183,31 @@ func assertCallSpawnAdjacency(t *testing.T, recs []harness.Record) {
 			if err := rec.DecodePayload(&p); err != nil {
 				t.Fatalf("DecodePayload(assistant_tool_call): %v", err)
 			}
-			lastCall[p.CallID] = i
+			if _, ok := firstCall[p.CallID]; !ok {
+				firstCall[p.CallID] = i
+			}
+		case harness.KindToolOutcome:
+			var p harness.ToolOutcomePayload
+			if err := rec.DecodePayload(&p); err != nil {
+				t.Fatalf("DecodePayload(tool_outcome): %v", err)
+			}
+			if _, ok := outcome[p.CallID]; !ok {
+				outcome[p.CallID] = i
+			}
 		case harness.KindTaskSpawned:
 			var p harness.TaskSpawnedPayload
 			if err := rec.DecodePayload(&p); err != nil {
 				t.Fatalf("DecodePayload(task_spawned): %v", err)
 			}
-			callIdx, ok := lastCall[p.CallID]
-			if !ok {
+			if _, ok := firstCall[p.CallID]; !ok {
 				t.Fatalf("task_spawned at %d has no preceding assistant_tool_call for %q", i, p.CallID)
 			}
-			if i != callIdx+1 {
-				t.Fatalf("task_spawned for %q at %d, want immediately after its call at %d", p.CallID, i, callIdx)
+			if prev, dup := spawned[p.CallID]; dup {
+				t.Fatalf("second task_spawned for %q at %d (first at %d)", p.CallID, i, prev)
+			}
+			spawned[p.CallID] = i
+			if oi, ok := outcome[p.CallID]; ok {
+				t.Fatalf("task_spawned for %q at %d lands after its tool_outcome at %d", p.CallID, i, oi)
 			}
 		}
 	}
@@ -234,7 +272,7 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 	if childSub.Depth != 1 {
 		t.Errorf("child depth = %d, want 1", childSub.Depth)
 	}
-	if want := parentSub.ID + ":call-1"; childSub.ID != want {
+	if want := parentSub.ID + ":" + safeCallID("call-1"); childSub.ID != want {
 		t.Errorf("child dispatch id = %q, want %q", childSub.ID, want)
 	}
 
@@ -273,7 +311,7 @@ func TestTaskToolAdmitsChildAndSuspends(t *testing.T) {
 	wantSpawn := harness.TaskSpawnedPayload{
 		CallID:              "call-1",
 		Agent:               "reviewer",
-		ChildInstance:       "acme:call-1",
+		ChildInstance:       "acme:" + safeCallID("call-1"),
 		ChildConversationID: childSub.ConversationID,
 		ChildSubmissionID:   childSub.ID,
 		Prompt:              "check it",
@@ -455,13 +493,13 @@ func TestTaskToolSanitizesCallID(t *testing.T) {
 		t.Fatalf("children = %d, want 1", len(children))
 	}
 	childSub := children[0]
-	if want := "acme:call-1-x-y"; string(childSub.SessionKey.Instance) != want {
+	if want := "acme:" + safeCallID("call/1?x y"); string(childSub.SessionKey.Instance) != want {
 		t.Errorf("child instance = %q, want %q (sanitized callID)", childSub.SessionKey.Instance, want)
 	}
-	if want := "task-call-1-x-y"; childSub.SessionKey.Session != want {
+	if want := "task-" + safeCallID("call/1?x y"); childSub.SessionKey.Session != want {
 		t.Errorf("child session = %q, want %q (sanitized callID)", childSub.SessionKey.Session, want)
 	}
-	if want := parentSub.ID + ":call-1-x-y"; childSub.ID != want {
+	if want := parentSub.ID + ":" + safeCallID("call/1?x y"); childSub.ID != want {
 		t.Errorf("child dispatch id = %q, want %q (sanitized callID)", childSub.ID, want)
 	}
 	if childSub.ParentCallID != "call/1?x y" {
@@ -484,7 +522,7 @@ func TestTaskToolSanitizesCallID(t *testing.T) {
 	if spawn.CallID != "call/1?x y" {
 		t.Errorf("spawn CallID = %q, want the raw callID (wake correlates on it)", spawn.CallID)
 	}
-	if want := "acme:call-1-x-y"; spawn.ChildInstance != want {
+	if want := "acme:" + safeCallID("call/1?x y"); spawn.ChildInstance != want {
 		t.Errorf("spawn ChildInstance = %q, want %q (sanitized callID)", spawn.ChildInstance, want)
 	}
 }
@@ -753,5 +791,223 @@ func TestNoPolicyNoTaskTool(t *testing.T) {
 	}
 	if !sawEcho {
 		t.Error("request is missing the configured echo tool — tool wiring broken, assertion is vacuous")
+	}
+}
+
+// Two raw callIDs that sanitize to the same string ("call/1", "call?1")
+// still derive distinct dispatch IDs: the fnv mix-in keeps them from
+// aliasing into a replay, so both admit a child.
+func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		{
+			llm.ToolCallEndEvent{CallID: "call/1", ToolName: "task", Args: taskArgs("reviewer", "first")},
+			llm.ToolCallEndEvent{CallID: "call?1", ToolName: "task", Args: taskArgs("reviewer", "second")},
+			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
+		},
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("first done"),
+		textTurn("second done"),
+	}}
+	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+
+	children, err := store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children = %d, want 2 — colliding sanitized callIDs must not alias into a replay", len(children))
+	}
+	ids := map[string]bool{}
+	for _, ch := range children {
+		ids[ch.ID] = true
+	}
+	for _, raw := range []string{"call/1", "call?1"} {
+		if want := parentSub.ID + ":" + safeCallID(raw); !ids[want] {
+			t.Errorf("no child with dispatch id %q (raw callID %q)", want, raw)
+		}
+	}
+	for _, ch := range children {
+		if _, err := rt.Wait(ctx, ch.ID); err != nil {
+			t.Fatalf("Wait(child %s): %v", ch.ID, err)
+		}
+	}
+
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records(parent): %v", err)
+	}
+	if n := countKind(recs, harness.KindTaskSpawned); n != 2 {
+		t.Fatalf("task_spawned records = %d, want 2", n)
+	}
+	assertCallSpawnAdjacency(t, recs)
+}
+
+// A ToolCallEndEvent lost to agent-core's lossy event channel (dropped
+// after 100ms of backpressure) never reaches the consumer, so no
+// task_spawned is authored even though Dispatch admitted the child.
+// Park-time reconciliation repairs the record from durable child state —
+// recovering the SpawnRecordID from the child conversation's ParentRef —
+// and the parent still parks instead of settling SUCCESS with an orphan.
+func TestTaskToolDroppedSpawnEventReconciledAtParkTime(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		{
+			llm.ToolCallEndEvent{CallID: "dropped-call", ToolName: "task", Args: json.RawMessage(`{}`)},
+			llm.MessageEndEvent{StopReason: llm.StopReasonToolUse},
+		},
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}}
+
+	// The rig simulates the drop: the tool admits the child synchronously
+	// (Dispatch writes the parent link and the child conversation's
+	// ParentRef with the pre-minted spawn record ID), then returns a bare
+	// Suspend — the spawn payload never reaches the consumer, as if the
+	// ToolCallEndEvent had been dropped.
+	type dropRig struct {
+		parent        chan harness.DispatchResult
+		spawnRecordID string
+		rt            *harness.Runtime
+		child         harness.DispatchResult
+	}
+	rig := &dropRig{
+		parent:        make(chan harness.DispatchResult, 1),
+		spawnRecordID: "01J0000DROPPEDSPAWNRECORD000",
+	}
+	drop := pi.NewTool(pi.Tool[struct{}]{
+		Name: "task", Description: "simulates a dropped spawn event",
+		Execute: func(ctx context.Context, _ struct{}) (pi.ToolResult, error) {
+			parentRes := <-rig.parent
+			childRes, err := rig.rt.Dispatch(ctx, harness.Dispatch{
+				Agent:      "reviewer",
+				Instance:   "acme:dropped",
+				Session:    "task-dropped",
+				DispatchID: parentRes.SubmissionID + ":dropped-call",
+				Message:    harness.UserMessage("check it"),
+				Parent: &harness.SpawnParent{
+					SubmissionID:   parentRes.SubmissionID,
+					CallID:         "dropped-call",
+					ConversationID: parentRes.ConversationID,
+					SpawnRecordID:  rig.spawnRecordID,
+				},
+			})
+			if err != nil {
+				return pi.ToolResult{}, err
+			}
+			rig.child = childRes
+			// No Data: the spawn payload never arrived.
+			return pi.ToolResult{Suspend: true}, nil
+		},
+	})
+
+	define := func(desc string, p llm.LLMProvider) harness.AgentDefinition {
+		return harness.AgentDefinition{
+			Description: desc,
+			Initialize: func(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
+				return harness.AgentRuntimeConfig{
+					Model:         "mock/test-model",
+					ContextWindow: 200_000,
+					Providers:     []llm.LLMProvider{p},
+				}, nil
+			},
+		}
+	}
+	parentDef := define("routes work to specialists", parent)
+	parentDefTools := parentDef.Initialize
+	parentDef.Initialize = func(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
+		cfg, err := parentDefTools(ctx, id, env)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Tools = []pi.RegisteredTool{drop}
+		return cfg, nil
+	}
+	rt := startRuntime(t, harness.Config{
+		Agents: map[string]harness.AgentDefinition{
+			"triage":   parentDef,
+			"reviewer": define("reviews code for defects", child),
+		},
+		Store:         store,
+		ClaimInterval: 20 * time.Millisecond,
+		LeaseDuration: 300 * time.Millisecond,
+		// No Subagents policy: the rigged tool stands in for the injected
+		// task tool so the spawn payload can be "lost".
+	})
+	rig.rt = rt
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	rig.parent <- res
+
+	// The parent parks despite the lost spawn payload: children-existence,
+	// not the event channel, gates the park.
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+
+	// The reconciled spawn record recovers every field from durable child
+	// state, including the SpawnRecordID from the child conversation's
+	// conversation_created ParentRef.
+	recs, err := rt.Records(ctx, res.ConversationID, "")
+	if err != nil {
+		t.Fatalf("Records(parent): %v", err)
+	}
+	spawnIdx := findRecord(recs, harness.KindTaskSpawned)
+	if spawnIdx < 0 {
+		t.Fatal("park-time reconciliation did not author the missing task_spawned")
+	}
+	if recs[spawnIdx].ID != rig.spawnRecordID {
+		t.Errorf("spawn record ID = %q, want %q recovered from the child conversation's ParentRef", recs[spawnIdx].ID, rig.spawnRecordID)
+	}
+	var spawn harness.TaskSpawnedPayload
+	if err := recs[spawnIdx].DecodePayload(&spawn); err != nil {
+		t.Fatalf("DecodePayload(task_spawned): %v", err)
+	}
+	wantSpawn := harness.TaskSpawnedPayload{
+		CallID:              "dropped-call",
+		Agent:               "reviewer",
+		ChildInstance:       "acme:dropped",
+		ChildConversationID: rig.child.ConversationID,
+		ChildSubmissionID:   rig.child.SubmissionID,
+		Prompt:              "check it",
+	}
+	if spawn != wantSpawn {
+		t.Errorf("reconciled task_spawned payload = %+v, want %+v", spawn, wantSpawn)
+	}
+
+	// The child runs and settles; the parent stays parked (the wake is
+	// Task 9).
+	settled, err := rt.Wait(ctx, rig.child.SubmissionID)
+	if err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	if settled.Status != harness.SettledSucceeded {
+		t.Fatalf("child settled = %+v, want succeeded", settled)
+	}
+	again, err := store.GetSubmission(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission(parent): %v", err)
+	}
+	if again.Status != harness.StatusWaiting {
+		t.Errorf("parent status after child settle = %s, want waiting", again.Status)
 	}
 }

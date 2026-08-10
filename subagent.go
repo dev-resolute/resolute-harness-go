@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"slices"
 	"strings"
 	"sync"
@@ -68,9 +69,12 @@ type spawnData struct {
 // sanitizeCallID maps a provider-controlled call id into a safe charset for
 // the identifiers derived from it — the child Instance (a URL path
 // segment), Session, and DispatchID. Any byte outside [A-Za-z0-9_-]
-// becomes '-', and the result is bounded to 64 bytes.
+// becomes '-', the result is bounded to 48 bytes, and 8 hex chars of
+// fnv32(raw) are mixed in so two raw ids that sanitize to the same string
+// ("call/1", "call?1") still derive distinct identifiers instead of
+// aliasing into a replay.
 func sanitizeCallID(callID string) string {
-	const maxLen = 64
+	const maxLen = 48
 	b := []byte(callID)
 	for i, c := range b {
 		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_' || c == '-' {
@@ -81,7 +85,9 @@ func sanitizeCallID(callID string) string {
 	if len(b) > maxLen {
 		b = b[:maxLen]
 	}
-	return string(b)
+	h := fnv.New32a()
+	h.Write([]byte(callID))
+	return fmt.Sprintf("%s-%08x", string(b), h.Sum32())
 }
 
 // taskParams is the task tool's argument shape.
@@ -217,7 +223,7 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 		// The original admission already named a spawn record in the child
 		// conversation's ParentRef; reuse that ID so the record the
 		// consumer authors keeps the link valid.
-		id, err := t.childSpawnRecordID(ctx, res.ConversationID)
+		id, err := childSpawnRecordID(ctx, t.rt.store, res.ConversationID)
 		if err != nil {
 			return pi.ToolResult{}, err
 		}
@@ -243,12 +249,12 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 }
 
 // childSpawnRecordID recovers the spawn record ID the child conversation
-// was created with, so a replayed admission reuses it. Empty when the
-// child conversation has no ParentRef (partial-honor, or a crash window);
-// the caller keeps its fresh ID and consumer-side dedupe still bounds the
-// records to one.
-func (t *taskTool) childSpawnRecordID(ctx context.Context, childConversationID string) (string, error) {
-	recs, err := t.rt.store.ReadRecords(ctx, childConversationID, "")
+// was created with, so a replayed admission or park-time reconciliation
+// reuses it. Empty when the child conversation has no ParentRef
+// (partial-honor, or a crash window); the replay caller keeps its fresh ID
+// and consumer-side dedupe still bounds the records to one.
+func childSpawnRecordID(ctx context.Context, store Store, childConversationID string) (string, error) {
+	recs, err := store.ReadRecords(ctx, childConversationID, "")
 	if err != nil {
 		return "", fmt.Errorf("read child records for spawn record id: %w", err)
 	}
@@ -269,8 +275,9 @@ func (t *taskTool) childSpawnRecordID(ctx context.Context, childConversationID s
 }
 
 // spawnRecordExists reports whether the conversation already holds a
-// task_spawned record for callID. Called from the consumer goroutine — the
-// single author of spawn records — so a miss reliably means "author one".
+// task_spawned record for callID. Called from the drive goroutine — the
+// single author of spawn records (consumer events and park-time
+// reconciliation alike) — so a miss reliably means "author one".
 func (r *submissionRun) spawnRecordExists(ctx context.Context, callID string) (bool, error) {
 	recs, err := r.rt.store.ReadRecords(ctx, r.conv.ID, "")
 	if err != nil {
@@ -289,6 +296,70 @@ func (r *submissionRun) spawnRecordExists(ctx context.Context, callID string) (b
 		}
 	}
 	return false, nil
+}
+
+// reconcileSpawnRecords repairs missing task_spawned records from durable
+// child state at park time and reports whether the suspension should park.
+//
+// The consumer authors task_spawned from ToolCallEndEvent.Data, which rides
+// agent-core's lossy event channel (events drop after 100ms of
+// backpressure): a dropped event strands an admitted child with no spawn
+// record, and pendingSpawns never sees it. The durable source of truth is
+// the child submission itself — Dispatch writes
+// ParentSubmissionID/ParentCallID synchronously at admission, and the child
+// conversation's conversation_created carries ParentRef.SpawnRecordID — so
+// every missing record is re-authored here, synchronously via the store,
+// NOT via the event path.
+//
+// The park gate is children-existence (channel-independent), with
+// pendingSpawns as belt-and-braces (a resolved spawn record implies an
+// admitted child). Zero children and zero pending spawns is a genuine bare
+// suspend — a non-task tool returned Suspend — and settles normally.
+func (r *submissionRun) reconcileSpawnRecords(ctx context.Context) (bool, error) {
+	children, err := r.rt.store.ListChildSubmissions(ctx, r.sub.ID)
+	if err != nil {
+		return false, fmt.Errorf("list child submissions for spawn reconciliation: %w", err)
+	}
+	for _, ch := range children {
+		exists, err := r.spawnRecordExists(ctx, ch.ParentCallID)
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			continue
+		}
+		spawnRecordID, err := childSpawnRecordID(ctx, r.rt.store, ch.ConversationID)
+		if err != nil {
+			return false, err
+		}
+		if spawnRecordID == "" {
+			// No ParentRef on the child conversation (partial-honor, or a
+			// crash window — same disclosure as childSpawnRecordID): the
+			// record ID is unrecoverable. Parking still happens on
+			// children-existence.
+			r.rt.logger.Warn("spawn reconciliation: child conversation has no parent ref; cannot recover spawn record id",
+				"submission", r.sub.ID, "childSubmission", ch.ID)
+			continue
+		}
+		rec := r.record(KindTaskSpawned, &TaskSpawnedPayload{
+			CallID:              ch.ParentCallID,
+			Agent:               ch.SessionKey.Agent,
+			ChildInstance:       string(ch.SessionKey.Instance),
+			ChildConversationID: ch.ConversationID,
+			ChildSubmissionID:   ch.ID,
+			Prompt:              ch.Input.Body,
+		})
+		rec.ID = spawnRecordID
+		if err := r.append(ctx, rec); err != nil {
+			return false, err
+		}
+		r.rt.observe(RecoveryEvent{
+			Correlation: r.correlation(),
+			Decision:    "spawn_record_reconciled",
+			Detail:      fmt.Sprintf("authored missing task_spawned for call %s from durable child submission %s", ch.ParentCallID, ch.ID),
+		})
+	}
+	return len(children) > 0 || r.pendingSpawns > 0, nil
 }
 
 // waitDeadline bounds a suspension when SubagentLimits.MaxWait is set; a

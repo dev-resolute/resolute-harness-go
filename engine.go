@@ -511,17 +511,22 @@ type submissionRun struct {
 	// prompt requested one.
 	result json.RawMessage
 
-	// suspended reports the prompt ended on a Suspend-marked task call
-	// (HARNESS-15); the attempt parks the submission in waiting instead of
-	// settling it. Single-goroutine invariant: written in promptOnce and
-	// read in drive/driveAttempt, all on the drive goroutine — unlike the
-	// mutex-guarded fields above it needs no lock.
+	// suspended reports the prompt ended on a Suspend-marked call
+	// (HARNESS-15). Whether the attempt parks is decided in drive from
+	// durable child state (reconcileSpawnRecords): parking leaves this set
+	// and runSubmission waits the submission; a genuine bare Suspend from a
+	// non-task tool clears it and the run settles normally. Single-goroutine
+	// invariant: written in promptOnce/drive and read in drive/driveAttempt,
+	// all on the drive goroutine — unlike the mutex-guarded fields above it
+	// needs no lock.
 	suspended bool
 
 	// pendingSpawns counts the task_spawned records resolved for this
 	// attempt (authored by the consumer, or already durable from a prior
-	// admission). It gates suspended: a bare Suspend result with no spawn
-	// record must settle normally, never park (HARNESS-15 review). Same
+	// admission). It feeds the park gate in reconcileSpawnRecords
+	// (children-existence || pendingSpawns; HARNESS-15 re-review) as
+	// belt-and-braces — the spawn payload rides agent-core's lossy event
+	// channel, so this count alone cannot be trusted. Same
 	// single-goroutine invariant as suspended.
 	pendingSpawns int
 
@@ -653,9 +658,19 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		return err
 	}
 	if r.suspended {
-		// Suspended on a task call: no final answer to validate this
-		// attempt.
-		return nil
+		// Park-time reconciliation (HARNESS-15 re-review): repair any spawn
+		// record the lossy event channel dropped, from durable child state,
+		// then decide. Parking skips result validation — no final answer
+		// this attempt; a genuine bare suspend falls through and settles
+		// normally.
+		park, err := r.reconcileSpawnRecords(ctx)
+		if err != nil {
+			return err
+		}
+		if park {
+			return nil
+		}
+		r.suspended = false
 	}
 	if len(r.sub.Input.ResultSchema) > 0 {
 		return r.validateResultLoop(ctx, agent)
@@ -836,9 +851,12 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	if ctx.Err() != nil {
 		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
 	}
-	if result.Suspended && r.pendingSpawns > 0 {
-		// Park only when at least one task_spawned record resolved this
-		// attempt; a bare Suspend (no spawn data) settles normally.
+	if result.Suspended {
+		// Propagate the suspension regardless of pendingSpawns: the spawn
+		// payload rides agent-core's lossy event channel, so a dropped
+		// ToolCallEndEvent leaves pendingSpawns at zero with a live child.
+		// drive's park-time reconciliation makes the park/settle decision
+		// from durable child state.
 		r.suspended = true
 	}
 	return nil
@@ -979,6 +997,12 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 					})
 					rec.ID = sd.SpawnRecordID
 					if err := r.append(ctx, rec); err != nil {
+						// A failed append here orphans the admitted child: no
+						// task_spawned names it. Two nets catch that — park-time
+						// reconciliation re-authors the record from durable child
+						// state (reconcileSpawnRecords), and once Task 11 lands,
+						// a parent settling FAILED with live children triggers
+						// the orphan cascade.
 						return err
 					}
 				}
