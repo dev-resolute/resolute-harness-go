@@ -9,8 +9,8 @@ import (
 
 // wakeParent performs the settlement hand-off (HARNESS-15): when a spawned
 // child settles, append the parent's tool_outcome for the pending call and —
-// once it is the last unsettled child — requeue the parent. Idempotent: the
-// outcome record ID derives from the child submission ID, so re-wakes (the
+// once it is the last unsettled child — requeue the parent. Idempotent: an
+// existing outcome naming the pending CallID wins, so re-wakes (the
 // in-reservation run plus the post-finalize replay, or a crash-recovery
 // re-run) no-op.
 //
@@ -62,7 +62,7 @@ func (c *coordinator) wakeParent(ctx context.Context, child Submission, payload 
 	if !outcomeExists {
 		rec := Record{
 			RecordEnvelope: RecordEnvelope{
-				ID:             "wake-" + child.ID,
+				ID:             newULID(),
 				Kind:           KindToolOutcome,
 				ConversationID: parent.ConversationID,
 				Session:        parent.SessionKey.Session,
@@ -125,7 +125,11 @@ func (c *coordinator) wakeContent(ctx context.Context, child Submission, payload
 	}
 	content := payload.Error
 	if payload.ErrorCode != "" {
-		content = fmt.Sprintf("%s (code: %s)", payload.Error, payload.ErrorCode)
+		if content == "" {
+			content = fmt.Sprintf("error (code: %s)", payload.ErrorCode)
+		} else {
+			content = fmt.Sprintf("%s (code: %s)", content, payload.ErrorCode)
+		}
 	}
 	text, err := finalAssistantText(ctx, c.rt.store, child.ConversationID)
 	if err != nil {

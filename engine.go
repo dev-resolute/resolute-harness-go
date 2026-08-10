@@ -111,15 +111,26 @@ func (c *coordinator) reconcile(ctx context.Context) {
 // is honored; otherwise the outcome is unknowable and the submission settles
 // failed with the indeterminate code.
 func (c *coordinator) finalizeInterrupted(ctx context.Context, sub Submission) error {
-	if err := c.appendSettledRecordOnce(ctx, sub, SettledPayload{
+	effective, err := c.appendSettledRecordOnce(ctx, sub, SettledPayload{
 		Status:    SettledFailed,
 		Error:     "process crashed during settlement; run outcome unknown",
 		ErrorCode: SettledErrIndeterminate,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
 		return fmt.Errorf("finalize settlement: %w", err)
+	}
+	if sub.ParentSubmissionID != "" {
+		// Re-run the wake after finalization, as settle() does: a sibling
+		// settling concurrently may have seen this submission still
+		// terminalizing and skipped the requeue. Idempotent — the outcome
+		// record exists by now, and a duplicate ResumeSubmission loses its
+		// CAS.
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
+			return fmt.Errorf("wake parent after finalize: %w", err)
+		}
 	}
 	c.rt.notifySettled()
 	return nil
@@ -448,7 +459,8 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 	if err := c.rt.store.ReserveSettlement(ctx, sub.ID, sub.AttemptID); err != nil {
 		return fmt.Errorf("reserve settlement: %w", err)
 	}
-	if err := c.appendSettledRecordOnce(ctx, sub, payload); err != nil {
+	effective, err := c.appendSettledRecordOnce(ctx, sub, payload)
+	if err != nil {
 		return err
 	}
 	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
@@ -461,7 +473,7 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 		// every sibling settled, so exactly one post-finalize wake
 		// requeues the parent. Idempotent — the outcome record exists by
 		// now, and a duplicate ResumeSubmission loses its CAS.
-		if err := c.wakeParent(ctx, sub, payload); err != nil {
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
 			return fmt.Errorf("wake parent after finalize: %w", err)
 		}
 	}
@@ -474,11 +486,12 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 // (HARNESS-15 settlement hand-off) runs inside the same reservation,
 // honoring an existing settled record's payload over the caller's (a
 // crash-recovery replay passes the indeterminate failure even when the
-// run's real outcome landed before the crash).
-func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) error {
+// run's real outcome landed before the crash). It returns the effective
+// payload so the caller's post-finalize wake replays with the same one.
+func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) (SettledPayload, error) {
 	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
 	if err != nil {
-		return fmt.Errorf("read records before settle: %w", err)
+		return payload, fmt.Errorf("read records before settle: %w", err)
 	}
 	effective := payload
 	found := false
@@ -486,7 +499,7 @@ func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submissio
 		if rec.Kind == KindSubmissionSettled && rec.SubmissionID == sub.ID {
 			found = true
 			if err := rec.DecodePayload(&effective); err != nil {
-				return fmt.Errorf("decode existing settled record: %w", err)
+				return payload, fmt.Errorf("decode existing settled record: %w", err)
 			}
 			break
 		}
@@ -505,16 +518,16 @@ func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submissio
 			Payload: mustPayload(&payload),
 		}
 		if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
-			return fmt.Errorf("append settled record: %w", err)
+			return payload, fmt.Errorf("append settled record: %w", err)
 		}
 		c.rt.notifyAppend()
 	}
 	if sub.ParentSubmissionID != "" {
 		if err := c.wakeParent(ctx, sub, effective); err != nil {
-			return fmt.Errorf("wake parent: %w", err)
+			return payload, fmt.Errorf("wake parent: %w", err)
 		}
 	}
-	return nil
+	return effective, nil
 }
 
 // submissionRun is the session engine for one attempt: it owns the pi.Agent,
@@ -736,7 +749,9 @@ func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, promp
 		if errors.Is(err, pi.ErrNothingToResume) {
 			// The wake lands the outcome before requeueing, so a resume
 			// drive always finds a tool-result tail; a miss signals a
-			// wake-ordering bug — fail the attempt, never retry it.
+			// wake-ordering bug. Propagate: the catch-all arm settles the
+			// submission failed (run_failed) — a hard fail is intended,
+			// never a retry.
 			return err
 		}
 		if errors.Is(llm.AsContextOverflow(err), llm.ErrContextOverflow) {

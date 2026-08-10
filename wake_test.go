@@ -27,10 +27,10 @@ func userTexts(req llm.LLMRequest) []string {
 }
 
 // A child that settles succeeded hands its answer to the parent: the wake
-// appends the parent's tool_outcome for the pending call (record ID derived
-// from the child submission ID), requeues the parent, and the resume
-// drive's provider request ends in that tool result — the parent settles
-// succeeded.
+// appends the parent's tool_outcome for the pending call (a fresh ULID, so
+// the append-ordered record IDs the stores rely on stay monotonic),
+// requeues the parent, and the resume drive's provider request ends in
+// that tool result — the parent settles succeeded.
 func TestWakeLandsOutcomeAndRequeues(t *testing.T) {
 	t.Parallel()
 	store := memory.New()
@@ -71,8 +71,10 @@ func TestWakeLandsOutcomeAndRequeues(t *testing.T) {
 		t.Fatalf("child settled = %+v, want succeeded", childSettled)
 	}
 
-	// The wake landed the outcome before the requeue: the record ID derives
-	// from the child submission ID, the content is the child's final
+	// The wake landed the outcome before the requeue: the record carries a
+	// fresh ULID ordered after every prior record on the parent
+	// conversation (the stores rely on append-ordered IDs for
+	// ReadRecords(afterID)), and the content is the child's final
 	// assistant text (no structured result was requested).
 	recs, err := rt.Records(ctx, res.ConversationID, "")
 	if err != nil {
@@ -82,8 +84,10 @@ func TestWakeLandsOutcomeAndRequeues(t *testing.T) {
 	if outcomeIdx < 0 {
 		t.Fatal("no tool_outcome — the wake did not land")
 	}
-	if want := "wake-" + childSub.ID; recs[outcomeIdx].ID != want {
-		t.Errorf("outcome record ID = %q, want %q (deterministic from the child submission)", recs[outcomeIdx].ID, want)
+	for _, prior := range recs[:outcomeIdx] {
+		if recs[outcomeIdx].ID <= prior.ID {
+			t.Errorf("outcome record ID %q not ordered after prior record %q — append-order invariant violated", recs[outcomeIdx].ID, prior.ID)
+		}
 	}
 	var outcome harness.ToolOutcomePayload
 	if err := recs[outcomeIdx].DecodePayload(&outcome); err != nil {
@@ -348,12 +352,8 @@ func TestWakeIdempotent(t *testing.T) {
 	}
 	outcomes := 0
 	for _, rec := range recs {
-		if rec.Kind != harness.KindToolOutcome {
-			continue
-		}
-		outcomes++
-		if want := "wake-" + children[0].ID; rec.ID != want {
-			t.Errorf("outcome record ID = %q, want %q", rec.ID, want)
+		if rec.Kind == harness.KindToolOutcome {
+			outcomes++
 		}
 	}
 	if outcomes != 1 {
