@@ -78,17 +78,27 @@ func newCoordinator(rt *Runtime) *coordinator {
 // cancelled. It wakes on admission nudges and on a steady tick.
 func (c *coordinator) loop(ctx context.Context) {
 	c.reconcile(ctx)
+	// One startup pass at reconcile cadence: a wait that lapsed while the
+	// process was down must cancel its still-queued children before the
+	// first claimRunnable can pick them up. Inside the loop the scans are
+	// gated to ticker iterations (see below).
+	c.expireWaits(ctx)
 	ticker := time.NewTicker(c.rt.claimInterval)
 	defer ticker.Stop()
 	for {
 		c.reclaimExpired(ctx)
-		c.expireWaits(ctx)
 		c.claimRunnable(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-c.rt.wake:
 		case <-ticker.C:
+			// The wait scans are O(waiting-parents × log-size) per run, so
+			// they fire on ticker cadence only — on every nudge they would
+			// serialize against run goroutines on single-connection stores
+			// (sqlite SetMaxOpenConns(1)). reclaimExpired stays on nudges:
+			// its queries are O(1).
+			c.expireWaits(ctx)
 		}
 	}
 }
@@ -173,8 +183,9 @@ func (c *coordinator) reclaimExpired(ctx context.Context) {
 	}
 }
 
-// expireWaits is the wait scan (HARNESS-15), run on the same tick as
-// reclaimExpired. Two passes over parked parents:
+// expireWaits is the wait scan (HARNESS-15), gated to ticker iterations in
+// the claim loop — never to nudges — because its per-parent log reads are
+// O(waiting-parents × log-size). Two passes over parked parents:
 //
 //   - Expiry: a waiting submission whose WaitUntil lapsed can no longer pay
 //     off — its live children are cancelled, an error tool_outcome lands
@@ -237,8 +248,26 @@ func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
 		return err
 	}
 	if len(pending) > 0 {
+		// Re-check outcome existence immediately before appending: the
+		// natural wake (wakeParent) check-then-appends an outcome for the
+		// same CallID from another goroutine, so one can have landed since
+		// pendingSpawnedCalls read the log. This narrows the
+		// duplicate-outcome race window but does not close it — the
+		// eventual fix is a store-level guarded append (reject a second
+		// tool_outcome per CallID).
+		stillPending, err := c.pendingSpawnedCalls(ctx, sub)
+		if err != nil {
+			return err
+		}
+		open := make(map[string]bool, len(stillPending))
+		for _, callID := range stillPending {
+			open[callID] = true
+		}
 		outcomes := make([]Record, 0, len(pending))
 		for _, callID := range pending {
+			if !open[callID] {
+				continue // the wake landed this outcome concurrently
+			}
 			outcomes = append(outcomes, Record{
 				RecordEnvelope: RecordEnvelope{
 					ID:             newULID(),
@@ -256,10 +285,12 @@ func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
 				}),
 			})
 		}
-		if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, outcomes); err != nil {
-			return fmt.Errorf("append wait-expiry outcomes: %w", err)
+		if len(outcomes) > 0 {
+			if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, outcomes); err != nil {
+				return fmt.Errorf("append wait-expiry outcomes: %w", err)
+			}
+			c.rt.notifyAppend()
 		}
-		c.rt.notifyAppend()
 	}
 
 	if err := c.rt.store.ResumeSubmission(ctx, sub.ID); err != nil {
@@ -277,9 +308,12 @@ func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
 }
 
 // backstopWake re-runs the settlement wake for a waiting submission whose
-// children all settled but which still lacks the outcome for a spawned call
-// — the wake was lost to a crash window. wakeParent is idempotent, so a
-// submission whose outcomes all landed costs only the reads.
+// children all settled — covering two lost-wake windows: the outcome for a
+// spawned call never landed (crash mid-wake), or the outcome landed but the
+// parent's ResumeSubmission was lost (the wake's requeue CAS repairs it).
+// wakeParent is idempotent — an existing outcome wins, a duplicate requeue
+// loses its CAS — so a submission whose wake fully landed costs only the
+// reads.
 func (c *coordinator) backstopWake(ctx context.Context, sub Submission) error {
 	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
 	if err != nil {
@@ -298,12 +332,17 @@ func (c *coordinator) backstopWake(ctx context.Context, sub Submission) error {
 		return err
 	}
 	for _, ch := range children {
-		if !slices.Contains(pending, ch.ParentCallID) {
-			continue
-		}
-		payload, err := c.settledPayload(ctx, ch)
-		if err != nil {
-			return err
+		// Wake unconditionally once all children are settled — the
+		// ResumeSubmission CAS is what repairs a lost requeue even when the
+		// outcome already landed. The payload (and its log read) is only
+		// needed while the outcome work for this call is still pending.
+		var payload SettledPayload
+		if slices.Contains(pending, ch.ParentCallID) {
+			var err error
+			payload, err = c.settledPayload(ctx, ch)
+			if err != nil {
+				return err
+			}
 		}
 		if err := c.wakeParent(ctx, ch, payload); err != nil {
 			return fmt.Errorf("backstop wake for child %s: %w", ch.ID, err)
@@ -1012,7 +1051,8 @@ func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
 	var order []danglingCall
 	pending := make(map[string]bool)
 
-	for _, rec := range Reduce(recs).ActiveLeafPath() {
+	path := Reduce(recs).ActiveLeafPath()
+	for _, rec := range path {
 		switch rec.Kind {
 		case KindAssistantToolCall:
 			var p AssistantToolCallPayload
@@ -1036,8 +1076,10 @@ func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
 	// parent never sees a fabricated error for a live child (which the
 	// wake's existing-outcome-wins check would then honor forever). A
 	// missing child row means the admission never landed — treat it as
-	// settled and let the call reconcile.
-	for _, rec := range recs {
+	// settled and let the call reconcile. The lookup walks the same
+	// active-path slice pending was built from (CallIDs are assumed unique
+	// per path).
+	for _, rec := range path {
 		if rec.Kind != KindTaskSpawned {
 			continue
 		}

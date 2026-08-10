@@ -43,7 +43,10 @@ func (c *coordinator) wakeParent(ctx context.Context, child Submission, payload 
 	// synthesized one, and a re-wake must not double-author. The
 	// check-then-append idempotency relies on single-process wake
 	// serialization; multi-node duplicate-wake fencing is deferred (see
-	// docs/adr/0010-v1-scope-full-engine-semantics.md).
+	// docs/adr/0010-v1-scope-full-engine-semantics.md). The same
+	// check-then-append races expireWait's wait-expiry outcomes for the
+	// same CallID; as there, the eventual close is a store-level guarded
+	// append.
 	recs, err := c.rt.store.ReadRecords(ctx, parent.ConversationID, "")
 	if err != nil {
 		return fmt.Errorf("read parent records for wake: %w", err)

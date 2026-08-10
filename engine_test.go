@@ -594,9 +594,14 @@ func TestRestartOverSameSQLiteStoreResumes(t *testing.T) {
 	}
 
 	// Wait until the first attempt has durably authored the input record
-	// (so the history provably spans both attempts), then stop the Runtime
-	// mid-run — the model call is stalled on the scripted delay.
+	// (so the history provably spans both attempts) AND consumed the
+	// stalled script step — the mock pops a step when the call starts, so
+	// without this a fast Close can cancel attempt 1 before the pop and
+	// the restarted attempt would replay step 1 (5s stall, wrong text).
+	// Then stop the Runtime mid-run — the model call is stalled on the
+	// scripted delay.
 	waitForRecordKind(t, store, res.ConversationID, harness.KindUserMessage)
+	waitFor(t, func() bool { return provider.Called() >= 1 }, "attempt 1 never consumed the stalled script step")
 	if err := rt1.Close(); err != nil {
 		t.Fatalf("Close 1: %v", err)
 	}
@@ -659,15 +664,23 @@ func TestRestartOverSameSQLiteStoreResumes(t *testing.T) {
 // conversation.
 func waitForRecordKind(t *testing.T, store harness.Store, conversationID string, kind harness.RecordKind) {
 	t.Helper()
+	waitFor(t, func() bool {
+		recs, err := store.ReadRecords(context.Background(), conversationID, "")
+		return err == nil && countKind(recs, kind) > 0
+	}, fmt.Sprintf("conversation %s never grew a %s record", conversationID, kind))
+}
+
+// waitFor polls cond until it holds, failing the test after 10s.
+func waitFor(t *testing.T, cond func() bool, failMsg string) {
+	t.Helper()
 	deadline := time.After(10 * time.Second)
 	for {
-		recs, err := store.ReadRecords(context.Background(), conversationID, "")
-		if err == nil && countKind(recs, kind) > 0 {
+		if cond() {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("conversation %s never grew a %s record", conversationID, kind)
+			t.Fatal(failMsg)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
