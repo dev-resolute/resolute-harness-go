@@ -73,6 +73,14 @@ type SubmissionRelease struct {
 	LastError    string
 }
 
+// SubmissionWait carries the parameters of a wait CAS: the submission to move
+// running→waiting (HARNESS-15 suspension) and the optional wait bound.
+type SubmissionWait struct {
+	SubmissionID string
+	AttemptID    string
+	WaitUntil    time.Time // zero = unbounded
+}
+
 // SubmissionStore is the durable submission half of the store contract.
 // Implementations must make AdmitSubmission idempotent by submission ID and
 // every state transition an atomic CAS on the expected prior state.
@@ -113,6 +121,23 @@ type SubmissionStore interface {
 	// SubmissionRelease). It returns ErrClaimLost when the submission is
 	// not running or is owned by a different attempt.
 	ReleaseSubmission(ctx context.Context, release SubmissionRelease) error
+	// WaitSubmission CAS-transitions running→waiting, releasing the lease.
+	// ErrClaimLost when the attempt no longer owns the submission.
+	WaitSubmission(ctx context.Context, wait SubmissionWait) error
+	// ResumeSubmission CAS-transitions waiting→queued (a wake landed).
+	ResumeSubmission(ctx context.Context, submissionID string) error
+	// ListChildSubmissions returns submissions spawned by parentSubmissionID.
+	ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]Submission, error)
+	// ListExpiredWaits returns waiting submissions with WaitUntil before now.
+	ListExpiredWaits(ctx context.Context, now time.Time) ([]Submission, error)
+	// CancelSubmission transitions a queued or waiting submission straight to
+	// settled (no attempt ever completes it), recording reason into
+	// LastError, and reports wasRunning=false. A running submission instead
+	// gets CancelRequested=true and wasRunning=true with no status change —
+	// the owning coordinator cancels the run context and settles it. Cancel
+	// against a terminalizing or settled submission returns ErrClaimLost
+	// (already terminal).
+	CancelSubmission(ctx context.Context, submissionID, reason string) (wasRunning bool, err error)
 	// ReserveSettlement atomically moves the submission
 	// running→terminalizing — phase one of settlement. It returns
 	// ErrClaimLost when the submission is not running or is owned by a

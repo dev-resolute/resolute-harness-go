@@ -489,6 +489,36 @@ func (s *Store) ReleaseSubmission(ctx context.Context, release harness.Submissio
 	return casApplied(res, s.submissionExists(ctx, release.SubmissionID))
 }
 
+// WaitSubmission implements the corresponding harness.Store method; the sqlite
+// transition lands with schema v3 in the follow-up commit (HARNESS-15).
+func (s *Store) WaitSubmission(ctx context.Context, wait harness.SubmissionWait) error {
+	return errors.New("sqlite: WaitSubmission not implemented yet (schema v3 pending)")
+}
+
+// ResumeSubmission implements the corresponding harness.Store method; the sqlite
+// transition lands with schema v3 in the follow-up commit (HARNESS-15).
+func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error {
+	return errors.New("sqlite: ResumeSubmission not implemented yet (schema v3 pending)")
+}
+
+// ListChildSubmissions implements the corresponding harness.Store method; the
+// sqlite query lands with schema v3 in the follow-up commit (HARNESS-15).
+func (s *Store) ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]harness.Submission, error) {
+	return nil, errors.New("sqlite: ListChildSubmissions not implemented yet (schema v3 pending)")
+}
+
+// ListExpiredWaits implements the corresponding harness.Store method; the
+// sqlite query lands with schema v3 in the follow-up commit (HARNESS-15).
+func (s *Store) ListExpiredWaits(ctx context.Context, now time.Time) ([]harness.Submission, error) {
+	return nil, errors.New("sqlite: ListExpiredWaits not implemented yet (schema v3 pending)")
+}
+
+// CancelSubmission implements the corresponding harness.Store method; the sqlite
+// transition lands with schema v3 in the follow-up commit (HARNESS-15).
+func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (bool, error) {
+	return false, errors.New("sqlite: CancelSubmission not implemented yet (schema v3 pending)")
+}
+
 // ReserveSettlement implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID string) error {

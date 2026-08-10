@@ -37,6 +37,9 @@ func Run(t *testing.T, factory Factory) {
 		{"ReleaseSubmission", testReleaseSubmission},
 		{"SettlementPhases", testSettlementPhases},
 		{"FinalizeIdempotent", testFinalizeIdempotent},
+		{"WaitAndResumeTransitions", testWaitAndResumeTransitions},
+		{"ChildListingAndWaitExpiry", testChildListingAndWaitExpiry},
+		{"CancelSubmissionTransitions", testCancelSubmissionTransitions},
 		{"ConversationEnsureAndGet", testConversationEnsureAndGet},
 		{"RecordAppendAndReadFromOffset", testRecordAppendAndReadFromOffset},
 		{"AttachmentPutGet", testAttachmentPutGet},
@@ -405,6 +408,252 @@ func testFinalizeIdempotent(t *testing.T, s harness.Store) {
 	// A crash between the phases makes reconciliation finalize again.
 	if err := s.FinalizeSettlement(ctx, sub.ID); err != nil {
 		t.Fatalf("repeated FinalizeSettlement = %v, want nil (idempotent)", err)
+	}
+}
+
+func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
+	ctx := ctxT(t)
+	sub := claim(t, s, admit(t, s, "default"))
+
+	// A stale attempt cannot park the submission.
+	err := s.WaitSubmission(ctx, harness.SubmissionWait{SubmissionID: sub.ID, AttemptID: "stale-attempt"})
+	if !errors.Is(err, harness.ErrClaimLost) {
+		t.Fatalf("stale wait error = %v, want ErrClaimLost", err)
+	}
+
+	waitUntil := time.Now().Add(time.Hour)
+	if err := s.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: sub.ID,
+		AttemptID:    sub.AttemptID,
+		WaitUntil:    waitUntil,
+	}); err != nil {
+		t.Fatalf("WaitSubmission: %v", err)
+	}
+	got, err := s.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusWaiting {
+		t.Fatalf("waiting status = %q, want waiting", got.Status)
+	}
+	if !got.PendingResume {
+		t.Fatalf("PendingResume = false, want true (next drive must Resume)")
+	}
+	if !got.WaitUntil.Equal(waitUntil) {
+		t.Fatalf("WaitUntil = %v, want %v", got.WaitUntil, waitUntil)
+	}
+	if got.AttemptID != "" || got.OwnerID != "" || !got.LeaseExpiresAt.IsZero() {
+		t.Fatalf("waiting submission still leased: attempt=%q owner=%q lease=%v", got.AttemptID, got.OwnerID, got.LeaseExpiresAt)
+	}
+
+	// A waiting submission is neither runnable nor lease-expired.
+	runnable, err := s.ListRunnable(ctx)
+	if err != nil {
+		t.Fatalf("ListRunnable: %v", err)
+	}
+	if len(runnable) != 0 {
+		t.Fatalf("runnable with waiting head = %v, want none", keys(ids(runnable)))
+	}
+	expired, err := s.ListExpiredLeases(ctx, time.Now().Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("ListExpiredLeases: %v", err)
+	}
+	if len(expired) != 0 {
+		t.Fatalf("expired leases with waiting head = %v, want none (wait released the lease)", keys(ids(expired)))
+	}
+
+	// A wake requeues the submission and clears the wait markers.
+	if err := s.ResumeSubmission(ctx, sub.ID); err != nil {
+		t.Fatalf("ResumeSubmission: %v", err)
+	}
+	got, err = s.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusQueued {
+		t.Fatalf("resumed status = %q, want queued", got.Status)
+	}
+	if got.PendingResume || !got.WaitUntil.IsZero() {
+		t.Fatalf("resumed submission still marked: PendingResume=%v WaitUntil=%v", got.PendingResume, got.WaitUntil)
+	}
+	runnable, err = s.ListRunnable(ctx)
+	if err != nil {
+		t.Fatalf("ListRunnable: %v", err)
+	}
+	if len(runnable) != 1 || runnable[0].ID != sub.ID {
+		t.Fatalf("runnable after resume = %v, want [%s]", keys(ids(runnable)), sub.ID)
+	}
+
+	// Resuming a non-waiting submission loses the CAS.
+	if err := s.ResumeSubmission(ctx, sub.ID); !errors.Is(err, harness.ErrClaimLost) {
+		t.Fatalf("resume of queued error = %v, want ErrClaimLost", err)
+	}
+}
+
+func testChildListingAndWaitExpiry(t *testing.T, s harness.Store) {
+	ctx := ctxT(t)
+	parent := admit(t, s, "parent-session")
+
+	admitChild := func(session, callID string) harness.Submission {
+		t.Helper()
+		child := newSubmission(session)
+		child.ParentSubmissionID = parent.ID
+		child.ParentCallID = callID
+		child.Depth = 1
+		admitted, err := s.AdmitSubmission(ctx, child)
+		if err != nil {
+			t.Fatalf("AdmitSubmission(child): %v", err)
+		}
+		return admitted
+	}
+	child1 := admitChild("child-1", "call-1")
+	child2 := admitChild("child-2", "call-2")
+	admit(t, s, "unrelated")
+
+	children, err := s.ListChildSubmissions(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 2 || children[0].ID != child1.ID || children[1].ID != child2.ID {
+		t.Fatalf("children = %v, want [%s %s] in admission order", keys(ids(children)), child1.ID, child2.ID)
+	}
+	if children[0].ParentCallID != "call-1" || children[0].Depth != 1 {
+		t.Fatalf("child link = %+v, want call-1 at depth 1", children[0])
+	}
+	none, err := s.ListChildSubmissions(ctx, child1.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions(child1): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("children of child1 = %v, want none", keys(ids(none)))
+	}
+
+	// Claiming a child does not affect the listing.
+	claimed1 := claim(t, s, child1)
+	children, err = s.ListChildSubmissions(ctx, parent.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions after claim: %v", err)
+	}
+	if len(children) != 2 {
+		t.Fatalf("children after claim = %v, want both still listed", keys(ids(children)))
+	}
+
+	// A bounded wait whose deadline passed is expired; an unbounded wait
+	// never is.
+	if err := s.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: child1.ID,
+		AttemptID:    claimed1.AttemptID,
+		WaitUntil:    time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("WaitSubmission(child1): %v", err)
+	}
+	claimed2 := claim(t, s, child2)
+	if err := s.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: child2.ID,
+		AttemptID:    claimed2.AttemptID,
+	}); err != nil {
+		t.Fatalf("WaitSubmission(child2): %v", err)
+	}
+
+	expired, err := s.ListExpiredWaits(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("ListExpiredWaits: %v", err)
+	}
+	if len(expired) != 1 || expired[0].ID != child1.ID {
+		t.Fatalf("expired waits = %v, want [%s]", keys(ids(expired)), child1.ID)
+	}
+	expired, err = s.ListExpiredWaits(ctx, time.Now().Add(100*time.Hour))
+	if err != nil {
+		t.Fatalf("ListExpiredWaits(far future): %v", err)
+	}
+	if ids(expired)[child2.ID] {
+		t.Fatalf("unbounded wait of %s must never expire", child2.ID)
+	}
+}
+
+func testCancelSubmissionTransitions(t *testing.T, s harness.Store) {
+	ctx := ctxT(t)
+
+	// Queued: straight to settled with the reason recorded.
+	queued := admit(t, s, "queued-session")
+	wasRunning, err := s.CancelSubmission(ctx, queued.ID, "operator kill")
+	if err != nil {
+		t.Fatalf("CancelSubmission(queued): %v", err)
+	}
+	if wasRunning {
+		t.Fatalf("CancelSubmission(queued) wasRunning = true, want false")
+	}
+	got, err := s.GetSubmission(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusSettled {
+		t.Fatalf("cancelled queued status = %q, want settled", got.Status)
+	}
+	if got.LastError != "operator kill" {
+		t.Fatalf("cancelled queued LastError = %q, want %q", got.LastError, "operator kill")
+	}
+	runnable, err := s.ListRunnable(ctx)
+	if err != nil {
+		t.Fatalf("ListRunnable: %v", err)
+	}
+	if len(runnable) != 0 {
+		t.Fatalf("runnable after cancel = %v, want none", keys(ids(runnable)))
+	}
+
+	// Waiting: same — settled with the reason recorded.
+	waiting := claim(t, s, admit(t, s, "waiting-session"))
+	if err := s.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: waiting.ID,
+		AttemptID:    waiting.AttemptID,
+	}); err != nil {
+		t.Fatalf("WaitSubmission: %v", err)
+	}
+	wasRunning, err = s.CancelSubmission(ctx, waiting.ID, "orphan cascade")
+	if err != nil {
+		t.Fatalf("CancelSubmission(waiting): %v", err)
+	}
+	if wasRunning {
+		t.Fatalf("CancelSubmission(waiting) wasRunning = true, want false")
+	}
+	got, err = s.GetSubmission(ctx, waiting.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusSettled || got.LastError != "orphan cascade" {
+		t.Fatalf("cancelled waiting = (status %q, LastError %q), want (settled, orphan cascade)", got.Status, got.LastError)
+	}
+
+	// Running: flagged for the owning coordinator, no status change.
+	running := claim(t, s, admit(t, s, "running-session"))
+	wasRunning, err = s.CancelSubmission(ctx, running.ID, "orphan cascade")
+	if err != nil {
+		t.Fatalf("CancelSubmission(running): %v", err)
+	}
+	if !wasRunning {
+		t.Fatalf("CancelSubmission(running) wasRunning = false, want true")
+	}
+	got, err = s.GetSubmission(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusRunning {
+		t.Fatalf("cancelled running status = %q, want running (owner settles it)", got.Status)
+	}
+	if !got.CancelRequested {
+		t.Fatalf("CancelRequested = false, want true")
+	}
+
+	// Already terminal: the cancel CAS does not apply.
+	settled := claim(t, s, admit(t, s, "settled-session"))
+	if err := s.ReserveSettlement(ctx, settled.ID, settled.AttemptID); err != nil {
+		t.Fatalf("ReserveSettlement: %v", err)
+	}
+	if err := s.FinalizeSettlement(ctx, settled.ID); err != nil {
+		t.Fatalf("FinalizeSettlement: %v", err)
+	}
+	if _, err := s.CancelSubmission(ctx, settled.ID, "too late"); err == nil {
+		t.Fatalf("CancelSubmission(settled) = nil, want error (already terminal)")
 	}
 }
 

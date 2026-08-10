@@ -271,6 +271,100 @@ func (s *Store) ReleaseSubmission(ctx context.Context, release harness.Submissio
 	return nil
 }
 
+// WaitSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) WaitSubmission(ctx context.Context, wait harness.SubmissionWait) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[wait.SubmissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusRunning || sub.AttemptID != wait.AttemptID {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusWaiting
+	sub.OwnerID = ""
+	sub.AttemptID = ""
+	sub.LeaseExpiresAt = time.Time{}
+	sub.PendingResume = true
+	sub.WaitUntil = wait.WaitUntil
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+// ResumeSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusWaiting {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusQueued
+	sub.PendingResume = false
+	sub.WaitUntil = time.Time{}
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+// ListChildSubmissions implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]harness.Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		if sub := s.subs[id]; sub.ParentSubmissionID == parentSubmissionID {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+// ListExpiredWaits implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListExpiredWaits(ctx context.Context, now time.Time) ([]harness.Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		sub := s.subs[id]
+		if sub.Status == harness.StatusWaiting && !sub.WaitUntil.IsZero() && !sub.WaitUntil.After(now) {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+// CancelSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return false, harness.ErrSubmissionNotFound
+	}
+	switch sub.Status {
+	case harness.StatusQueued, harness.StatusWaiting:
+		sub.Status = harness.StatusSettled
+		sub.LastError = reason
+		s.subs[sub.ID] = sub
+		return false, nil
+	case harness.StatusRunning:
+		sub.CancelRequested = true
+		s.subs[sub.ID] = sub
+		return true, nil
+	default: // terminalizing or settled — already terminal
+		return false, harness.ErrClaimLost
+	}
+}
+
 // ReserveSettlement implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
 func (s *Store) ReserveSettlement(ctx context.Context, submissionID, attemptID string) error {
