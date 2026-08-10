@@ -43,6 +43,8 @@ type Runtime struct {
 	deltaFlushInterval time.Duration
 	observers          []Observer
 	interceptors       []Interceptor
+	subagents          SubagentPolicy
+	limits             SubagentLimits
 
 	wake chan struct{} // nudges the coordinator claim loop
 
@@ -100,6 +102,8 @@ func NewRuntime(cfg Config) (*Runtime, error) {
 		deltaFlushInterval: deltaFlushInterval,
 		observers:          cfg.Observers,
 		interceptors:       cfg.Interceptors,
+		subagents:          cfg.Subagents,
+		limits:             cfg.resolveLimits(),
 		wake:               make(chan struct{}, 1),
 		liveRuns:           make(map[string]*pi.Agent),
 		appendSub:          make(chan struct{}),
