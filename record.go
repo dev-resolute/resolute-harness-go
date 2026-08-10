@@ -188,6 +188,9 @@ const (
 	// SettledErrResultInvalid means the structured result never validated
 	// against the requested schema within the feedback budget.
 	SettledErrResultInvalid SettledErrorCode = "result_schema_invalid"
+	// SettledErrCancelled means the submission was cancelled by the orphan
+	// cascade: its parent settled terminally (HARNESS-15).
+	SettledErrCancelled SettledErrorCode = "cancelled_by_parent"
 )
 
 // SettledPayload is the payload of a submission_settled record. Result is

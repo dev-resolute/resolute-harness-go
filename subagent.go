@@ -275,11 +275,13 @@ func childSpawnRecordID(ctx context.Context, store Store, childConversationID st
 }
 
 // spawnRecordExists reports whether the conversation already holds a
-// task_spawned record for callID. Called from the drive goroutine — the
-// single author of spawn records (consumer events and park-time
-// reconciliation alike) — so a miss reliably means "author one".
-func (r *submissionRun) spawnRecordExists(ctx context.Context, callID string) (bool, error) {
-	recs, err := r.rt.store.ReadRecords(ctx, r.conv.ID, "")
+// task_spawned record for callID. The drive goroutine is the primary author
+// of spawn records (consumer events and park-time reconciliation alike);
+// the settlement wake's repair (wakeParent) is the second sanctioned
+// out-of-band author. Both check-then-append by CallID, so a miss reliably
+// means "author one".
+func spawnRecordExists(ctx context.Context, store Store, conversationID, callID string) (bool, error) {
+	recs, err := store.ReadRecords(ctx, conversationID, "")
 	if err != nil {
 		return false, fmt.Errorf("read records for spawn dedupe: %w", err)
 	}
@@ -298,6 +300,76 @@ func (r *submissionRun) spawnRecordExists(ctx context.Context, callID string) (b
 	return false, nil
 }
 
+// spawnRecordRepair authors the task_spawned record for one child on the
+// parent conversation when none names the child's call, recovering the
+// record ID from the child conversation's ParentRef and the Agent,
+// Instance, and Prompt from the child row — the repair shared by park-time
+// reconciliation (reconcileSpawnRecords) and the settlement wake
+// (wakeParent), so the log order is call→spawn→outcome universally.
+//
+// The consumer path can race a wake-side repair (a fast child settle):
+// both paths name the same record ID, so the loser's append is a sqlite
+// UNIQUE error — re-checked and logged here, never fatal — or a same-ID
+// duplicate on memory (v1 single-process serialization keeps the window a
+// crash-settle artifact; docs/adr/0010-v1-scope-full-engine-semantics.md).
+// A missing ParentRef (partial-honor or crash window — the
+// childSpawnRecordID disclosure) leaves the record ID unrecoverable: warn
+// and skip; parking still gates on children-existence, and the wake still
+// lands the outcome.
+func spawnRecordRepair(ctx context.Context, rt *Runtime, parent Submission, child Submission, corr Correlation) error {
+	exists, err := spawnRecordExists(ctx, rt.store, parent.ConversationID, child.ParentCallID)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	spawnRecordID, err := childSpawnRecordID(ctx, rt.store, child.ConversationID)
+	if err != nil {
+		return err
+	}
+	if spawnRecordID == "" {
+		rt.logger.Warn("spawn record repair: child conversation has no parent ref; cannot recover spawn record id",
+			"parentSubmission", parent.ID, "childSubmission", child.ID)
+		return nil
+	}
+	rec := Record{
+		RecordEnvelope: RecordEnvelope{
+			ID:             spawnRecordID,
+			Kind:           KindTaskSpawned,
+			ConversationID: parent.ConversationID,
+			Session:        parent.SessionKey.Session,
+			SubmissionID:   parent.ID,
+			Time:           time.Now(),
+		},
+		Payload: mustPayload(&TaskSpawnedPayload{
+			CallID:              child.ParentCallID,
+			Agent:               child.SessionKey.Agent,
+			ChildInstance:       string(child.SessionKey.Instance),
+			ChildConversationID: child.ConversationID,
+			ChildSubmissionID:   child.ID,
+			Prompt:              child.Input.Body,
+		}),
+	}
+	if err := rt.store.AppendRecords(ctx, parent.ConversationID, []Record{rec}); err != nil {
+		// The check-then-append raced a same-ID author (the wake against
+		// the consumer): if the record landed, the loser logs and moves on.
+		if landed, checkErr := spawnRecordExists(ctx, rt.store, parent.ConversationID, child.ParentCallID); checkErr == nil && landed {
+			rt.logger.Warn("spawn record repair: a racing author landed the record first",
+				"parentSubmission", parent.ID, "childSubmission", child.ID, "error", err)
+			return nil
+		}
+		return fmt.Errorf("append repaired spawn record: %w", err)
+	}
+	rt.notifyAppend()
+	rt.observe(RecoveryEvent{
+		Correlation: corr,
+		Decision:    "spawn_record_reconciled",
+		Detail:      fmt.Sprintf("authored missing task_spawned for call %s from durable child submission %s", child.ParentCallID, child.ID),
+	})
+	return nil
+}
+
 // reconcileSpawnRecords repairs missing task_spawned records from durable
 // child state at park time and reports whether the suspension should park.
 //
@@ -308,8 +380,9 @@ func (r *submissionRun) spawnRecordExists(ctx context.Context, callID string) (b
 // the child submission itself — Dispatch writes
 // ParentSubmissionID/ParentCallID synchronously at admission, and the child
 // conversation's conversation_created carries ParentRef.SpawnRecordID — so
-// every missing record is re-authored here, synchronously via the store,
-// NOT via the event path.
+// every missing record is re-authored synchronously via the store
+// (spawnRecordRepair, shared with the settlement wake), NOT via the event
+// path.
 //
 // The park gate is children-existence (channel-independent), with
 // pendingSpawns as belt-and-braces (a resolved spawn record implies an
@@ -321,43 +394,9 @@ func (r *submissionRun) reconcileSpawnRecords(ctx context.Context) (bool, error)
 		return false, fmt.Errorf("list child submissions for spawn reconciliation: %w", err)
 	}
 	for _, ch := range children {
-		exists, err := r.spawnRecordExists(ctx, ch.ParentCallID)
-		if err != nil {
+		if err := spawnRecordRepair(ctx, r.rt, r.sub, ch, r.correlation()); err != nil {
 			return false, err
 		}
-		if exists {
-			continue
-		}
-		spawnRecordID, err := childSpawnRecordID(ctx, r.rt.store, ch.ConversationID)
-		if err != nil {
-			return false, err
-		}
-		if spawnRecordID == "" {
-			// No ParentRef on the child conversation (partial-honor, or a
-			// crash window — same disclosure as childSpawnRecordID): the
-			// record ID is unrecoverable. Parking still happens on
-			// children-existence.
-			r.rt.logger.Warn("spawn reconciliation: child conversation has no parent ref; cannot recover spawn record id",
-				"submission", r.sub.ID, "childSubmission", ch.ID)
-			continue
-		}
-		rec := r.record(KindTaskSpawned, &TaskSpawnedPayload{
-			CallID:              ch.ParentCallID,
-			Agent:               ch.SessionKey.Agent,
-			ChildInstance:       string(ch.SessionKey.Instance),
-			ChildConversationID: ch.ConversationID,
-			ChildSubmissionID:   ch.ID,
-			Prompt:              ch.Input.Body,
-		})
-		rec.ID = spawnRecordID
-		if err := r.append(ctx, rec); err != nil {
-			return false, err
-		}
-		r.rt.observe(RecoveryEvent{
-			Correlation: r.correlation(),
-			Decision:    "spawn_record_reconciled",
-			Detail:      fmt.Sprintf("authored missing task_spawned for call %s from durable child submission %s", ch.ParentCallID, ch.ID),
-		})
 	}
 	return len(children) > 0 || r.pendingSpawns > 0, nil
 }

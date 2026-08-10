@@ -466,6 +466,156 @@ func seedRecord(id string, kind harness.RecordKind, convID, session, subID, atte
 	}
 }
 
+// A child can settle while the parent's conversation still lacks the
+// task_spawned record for its call (a fast settle before the consumer
+// authored it, or the crash window between admission and the spawn event).
+// The wake repairs the record from durable child state BEFORE appending the
+// outcome — recovering the record ID from the child conversation's
+// ParentRef and the Agent/Instance/Prompt from the child row — so the log
+// order is call→spawn→outcome universally, and the parent is requeued.
+func TestWakeRepairsMissingSpawnRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := memory.New()
+
+	const (
+		parentAttempt = "01A0DEADATTEMPT00000000PA"
+		spawnRecID    = "01A0SEEDREC0000000000SPWN"
+	)
+
+	// The parent: claimed then parked in waiting with an unbounded wait,
+	// its conversation carrying the task call but NO spawn record — the
+	// crash/fast-settle window this test replays.
+	pKey := harness.SessionKey{Agent: "triage", Instance: "acme", Session: "default"}
+	pConv, _, err := store.EnsureConversation(ctx, harness.Conversation{
+		ID: "01A0SEEDCONV00000000000PAR", Key: pKey, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureConversation(parent): %v", err)
+	}
+	parent, err := store.AdmitSubmission(ctx, harness.Submission{
+		ID: "01A0SEEDSUB000000000000PAR", SessionKey: pKey, ConversationID: pConv.ID,
+		Status: harness.StatusQueued, Input: harness.UserMessage("triage this"), CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("AdmitSubmission(parent): %v", err)
+	}
+	if _, err := store.ClaimSubmission(ctx, harness.SubmissionClaim{
+		SubmissionID:   parent.ID,
+		AttemptID:      parentAttempt,
+		OwnerID:        "dead-owner",
+		LeaseExpiresAt: time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatalf("ClaimSubmission(parent): %v", err)
+	}
+	if err := store.WaitSubmission(ctx, harness.SubmissionWait{SubmissionID: parent.ID, AttemptID: parentAttempt}); err != nil {
+		t.Fatalf("WaitSubmission(parent): %v", err)
+	}
+	if err := store.AppendRecords(ctx, pConv.ID, []harness.Record{
+		seedRecord("01A0SEEDREC0000000000000R1", harness.KindConversationCreated, pConv.ID, "default", "", "",
+			&harness.ConversationCreatedPayload{Agent: "triage", Instance: "acme", Session: "default"}),
+		seedRecord("01A0SEEDREC0000000000000R2", harness.KindUserMessage, pConv.ID, "default", parent.ID, parentAttempt,
+			&harness.UserMessagePayload{Body: "triage this"}),
+		seedRecord("01A0SEEDREC0000000000000R3", harness.KindAssistantToolCall, pConv.ID, "default", parent.ID, parentAttempt,
+			&harness.AssistantToolCallPayload{CallID: "call-1", ToolName: "task", Args: taskArgs("reviewer", "check it")}),
+	}); err != nil {
+		t.Fatalf("AppendRecords(parent): %v", err)
+	}
+
+	// The child: queued, linked back to the call; its conversation's
+	// conversation_created carries the ParentRef with the spawn record ID
+	// the wake must recover.
+	cKey := harness.SessionKey{
+		Agent:    "reviewer",
+		Instance: harness.InstanceID("acme:" + safeCallID("call-1")),
+		Session:  "task-" + safeCallID("call-1"),
+	}
+	cConv, _, err := store.EnsureConversation(ctx, harness.Conversation{
+		ID: "01A0SEEDCONV00000000000CHA", Key: cKey, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("EnsureConversation(child): %v", err)
+	}
+	child, err := store.AdmitSubmission(ctx, harness.Submission{
+		ID: "01A0SEEDSUB000000000000CHA", SessionKey: cKey, ConversationID: cConv.ID,
+		Status: harness.StatusQueued, Input: harness.UserMessage("check it"), CreatedAt: time.Now(),
+		ParentSubmissionID: parent.ID, ParentCallID: "call-1", Depth: 1,
+	})
+	if err != nil {
+		t.Fatalf("AdmitSubmission(child): %v", err)
+	}
+	if err := store.AppendRecords(ctx, cConv.ID, []harness.Record{
+		seedRecord("01A0SEEDREC0000000000000C1", harness.KindConversationCreated, cConv.ID, cKey.Session, "", "",
+			&harness.ConversationCreatedPayload{Agent: "reviewer", Instance: cKey.Instance,
+				Session: cKey.Session, ParentRef: &harness.ParentRef{ConversationID: pConv.ID, SpawnRecordID: spawnRecID}}),
+	}); err != nil {
+		t.Fatalf("AppendRecords(child): %v", err)
+	}
+
+	// The child runs and settles; its wake faces a parent log with no
+	// spawn record for call-1. The parent's single scripted turn serves
+	// the resume drive the requeue triggers.
+	parentProv := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{textTurn("triage done")}}
+	childProv := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{textTurn("looks good")}}
+	rt := startRuntime(t, subagentConfig(store, parentProv, childProv, harness.SubagentLimits{}))
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	childSettled, err := rt.Wait(wctx, child.ID)
+	if err != nil {
+		t.Fatalf("Wait(child): %v", err)
+	}
+	if childSettled.Status != harness.SettledSucceeded {
+		t.Fatalf("child settled = %+v, want succeeded", childSettled)
+	}
+
+	// The repaired spawn record landed with the recovered ID BETWEEN the
+	// call and the wake outcome.
+	recs, err := rt.Records(wctx, pConv.ID, "")
+	if err != nil {
+		t.Fatalf("Records(parent): %v", err)
+	}
+	callIdx := findRecord(recs, harness.KindAssistantToolCall)
+	spawnIdx := findRecord(recs, harness.KindTaskSpawned)
+	outcomeIdx := findRecord(recs, harness.KindToolOutcome)
+	if callIdx < 0 || spawnIdx < 0 || outcomeIdx < 0 {
+		t.Fatalf("parent log: call at %d, spawn at %d, outcome at %d — all three must exist", callIdx, spawnIdx, outcomeIdx)
+	}
+	if !(callIdx < spawnIdx && spawnIdx < outcomeIdx) {
+		t.Fatalf("record order: call at %d, spawn at %d, outcome at %d, want call→spawn→outcome", callIdx, spawnIdx, outcomeIdx)
+	}
+	if recs[spawnIdx].ID != spawnRecID {
+		t.Errorf("repaired spawn record ID = %q, want %q recovered from the child conversation's ParentRef", recs[spawnIdx].ID, spawnRecID)
+	}
+	var spawn harness.TaskSpawnedPayload
+	if err := recs[spawnIdx].DecodePayload(&spawn); err != nil {
+		t.Fatalf("DecodePayload(task_spawned): %v", err)
+	}
+	wantSpawn := harness.TaskSpawnedPayload{
+		CallID:              "call-1",
+		Agent:               "reviewer",
+		ChildInstance:       string(cKey.Instance),
+		ChildConversationID: cConv.ID,
+		ChildSubmissionID:   child.ID,
+		Prompt:              "check it",
+	}
+	if spawn != wantSpawn {
+		t.Errorf("repaired task_spawned payload = %+v, want %+v", spawn, wantSpawn)
+	}
+
+	// The wake requeued the parent; the resume drive settled it.
+	parentSettled, err := rt.Wait(wctx, parent.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Fatalf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
+	}
+	if n := len(parentProv.requests()); n != 1 {
+		t.Errorf("parent provider calls = %d, want 1 (the resume drive)", n)
+	}
+}
+
 // settleInterleaveStore deterministically replays the concurrent-settle race
 // the recovery path's post-finalize wake (engine.go finalizeInterrupted)
 // closes: when the crashed terminalizing child's in-reservation wake lists

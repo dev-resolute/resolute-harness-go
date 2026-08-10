@@ -32,6 +32,10 @@ var errLeaseLost = errors.New("lease lost to another attempt")
 // (cooperative halt at a turn boundary).
 var errDeadlineHalted = errors.New("durability timeout reached mid-run")
 
+// errParentCancelled cancels a run whose parent settled terminally — the
+// orphan cascade (HARNESS-15) interrupts the orphaned child's attempt.
+var errParentCancelled = errors.New("parent settled; orphaned run cancelled")
+
 // danglingToolCallMessage is the harness-owned synthesized tool_outcome
 // content for a tool call recovered with no result: the process crashed
 // between the durable assistant_tool_call record and its tool_outcome, so
@@ -64,6 +68,12 @@ type coordinator struct {
 
 	mu     sync.Mutex
 	active map[string]bool // session keys with a run in flight in this process
+
+	// runs maps a live attempt's submission ID to its run-context cancel,
+	// so the orphan cascade can interrupt a running child of this process
+	// (v1 single-process; multi-node fencing is deferred, ADR-0010).
+	runsMu sync.Mutex
+	runs   map[string]context.CancelCauseFunc
 }
 
 func newCoordinator(rt *Runtime) *coordinator {
@@ -71,6 +81,7 @@ func newCoordinator(rt *Runtime) *coordinator {
 		rt:      rt,
 		ownerID: newULID(),
 		active:  make(map[string]bool),
+		runs:    make(map[string]context.CancelCauseFunc),
 	}
 }
 
@@ -530,6 +541,16 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 
 	runCtx, cancelRun := context.WithCancelCause(ctx)
 	defer cancelRun(nil)
+	// Register the run's cancel so the orphan cascade can interrupt it when
+	// this submission's parent settles; deleted on exit.
+	c.runsMu.Lock()
+	c.runs[sub.ID] = cancelRun
+	c.runsMu.Unlock()
+	defer func() {
+		c.runsMu.Lock()
+		delete(c.runs, sub.ID)
+		c.runsMu.Unlock()
+	}()
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
 	var result json.RawMessage
@@ -549,6 +570,16 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		// Another attempt owns the submission now; ours must not settle or
 		// release.
 		logger.Warn("lease lost mid-run; abandoning attempt")
+	case errors.Is(context.Cause(runCtx), errParentCancelled):
+		// The orphan cascade cancelled the run (the parent settled
+		// terminally): settle cancelled — distinct from the shutdown arm
+		// below, which RELEASES for retry; an orphan has nothing to retry
+		// for.
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
 	case runErr != nil && ctx.Err() != nil:
 		// Shutdown interrupted the attempt: release the claim so a fresh
 		// Runtime (or this store's next owner) re-attempts immediately.
@@ -663,6 +694,62 @@ func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, paylo
 	}
 	c.rt.observe(SubmissionSettledEvent{Correlation: sub.correlation(), Payload: payload})
 	c.rt.notifySettled()
+	if c.rt.limits.OnParentTerminal == CancelChildren {
+		c.cancelChildren(ctx, sub)
+	}
+}
+
+// cancelChildren is the orphan cascade (HARNESS-15): a terminally settled
+// parent's live children are cancelled. A running child is flagged via
+// CancelSubmission and its in-process run context cancelled (the registry
+// is v1-single-process, ADR-0010); its own post-drive switch settles it
+// cancelled_by_parent. A queued or waiting child will never start an
+// attempt: CancelSubmission settles the row outright, so the settled
+// record lands here directly.
+//
+// No re-entry guard is needed at v1 MaxDepth=1: a settling child has no
+// children of its own, so the cascade cannot recurse back into itself.
+func (c *coordinator) cancelChildren(ctx context.Context, parent Submission) {
+	children, err := c.rt.store.ListChildSubmissions(ctx, parent.ID)
+	if err != nil {
+		c.rt.logger.Warn("list children for cascade", "submission", parent.ID, "error", err)
+		return
+	}
+	for _, ch := range children {
+		if ch.Status == StatusSettled {
+			continue
+		}
+		wasRunning, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent "+parent.ID+" settled")
+		if err != nil {
+			// ErrClaimLost included: the child went terminal between the
+			// list and the cancel; its own settle owns the record.
+			c.rt.logger.Warn("cancel child", "child", ch.ID, "error", err)
+			continue
+		}
+		if wasRunning {
+			c.runsMu.Lock()
+			cancel, ok := c.runs[ch.ID]
+			c.runsMu.Unlock()
+			if ok {
+				cancel(errParentCancelled)
+			}
+			continue
+		}
+		// Queued/waiting: no attempt will run — CancelSubmission settled
+		// the row already, so land the settled record directly, bypassing
+		// settle's reservation (which expects a running row). The wake
+		// inside appendSettledRecordOnce is a guarded no-op: the parent is
+		// settled by now.
+		if _, err := c.appendSettledRecordOnce(ctx, ch, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}); err != nil {
+			c.rt.logger.Error("settle cancelled child", "child", ch.ID, "error", err)
+			continue
+		}
+		c.rt.notifySettled()
+	}
 }
 
 // driveAttempt runs the agent for one attempt, returning the validated
@@ -1350,7 +1437,7 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 			// wake authors the outcome on child settlement.
 			var sd spawnData
 			if err := json.Unmarshal(e.Result.Data, &sd); err == nil && sd.SpawnRecordID != "" {
-				exists, err := r.spawnRecordExists(ctx, sd.CallID)
+				exists, err := spawnRecordExists(ctx, r.rt.store, r.conv.ID, sd.CallID)
 				if err != nil {
 					return err
 				}
@@ -1368,9 +1455,9 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 						// A failed append here orphans the admitted child: no
 						// task_spawned names it. Two nets catch that — park-time
 						// reconciliation re-authors the record from durable child
-						// state (reconcileSpawnRecords), and once Task 11 lands,
-						// a parent settling FAILED with live children triggers
-						// the orphan cascade.
+						// state (reconcileSpawnRecords), and the orphan cascade
+						// (Task 11) cancels the child if the parent settles with
+						// it still live.
 						return err
 					}
 				}

@@ -32,6 +32,22 @@ func (c *coordinator) wakeParent(ctx context.Context, child Submission, payload 
 		return nil
 	}
 
+	// Repair a missing spawn record BEFORE appending the outcome: the child
+	// may have settled before the parent's consumer authored task_spawned
+	// (a fast settle, or the crash window between admission and the spawn
+	// event). The repair shares park-time reconciliation's recovery — the
+	// same check-then-append by CallID, the same record ID recovered from
+	// the child conversation's ParentRef — so the log order is
+	// call→spawn→outcome universally. A missing ParentRef skips the repair;
+	// the outcome still lands (the park-time disclosure).
+	if err := spawnRecordRepair(ctx, c.rt, parent, child, Correlation{
+		SessionKey:     parent.SessionKey,
+		ConversationID: parent.ConversationID,
+		SubmissionID:   parent.ID,
+	}); err != nil {
+		return fmt.Errorf("repair spawn record for wake: %w", err)
+	}
+
 	content, isError, err := c.wakeContent(ctx, child, payload)
 	if err != nil {
 		return err
