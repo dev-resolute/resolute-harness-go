@@ -354,6 +354,8 @@ func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason strin
 	case harness.StatusQueued, harness.StatusWaiting:
 		sub.Status = harness.StatusSettled
 		sub.LastError = reason
+		sub.PendingResume = false
+		sub.WaitUntil = time.Time{}
 		s.subs[sub.ID] = sub
 		return false, nil
 	case harness.StatusRunning:

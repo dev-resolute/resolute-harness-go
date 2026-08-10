@@ -586,42 +586,63 @@ func (s *Store) ListExpiredWaits(ctx context.Context, now time.Time) ([]harness.
 
 // CancelSubmission implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
-func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE submissions SET status = 'settled', last_error = ?
-		WHERE id = ? AND status IN ('queued', 'waiting')`,
-		reason, submissionID)
+func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (wasRunning bool, err error) {
+	// The settle-or-flag decision must be linearizable: a concurrent
+	// WaitSubmission landing between a status read and the UPDATEs must not
+	// make a live submission look terminal. One BEGIN IMMEDIATE transaction
+	// holds the write lock across the read-decide-write (safe: the pool is a
+	// single connection).
+	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+		return false, fmt.Errorf("cancel %s conn: %w", submissionID, err)
 	}
-	affected, err := res.RowsAffected()
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return false, fmt.Errorf("cancel %s begin: %w", submissionID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, rbErr := conn.ExecContext(context.Background(), "ROLLBACK"); rbErr != nil && err == nil {
+				err = fmt.Errorf("cancel %s rollback: %w", submissionID, rbErr)
+			}
+		}
+	}()
+
+	var status harness.SubmissionStatus
+	err = conn.QueryRowContext(ctx, `SELECT status FROM submissions WHERE id = ?`, submissionID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, harness.ErrSubmissionNotFound
+	}
 	if err != nil {
-		return false, fmt.Errorf("cancel %s rows: %w", submissionID, err)
+		return false, fmt.Errorf("cancel %s read: %w", submissionID, err)
 	}
-	if affected == 1 {
-		return false, nil
+	switch status {
+	case harness.StatusQueued, harness.StatusWaiting:
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE submissions SET status = 'settled', last_error = ?,
+				pending_resume = 0, wait_until_ns = 0
+			WHERE id = ?`,
+			reason, submissionID); err != nil {
+			return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+		}
+	case harness.StatusRunning:
+		// A running submission is only flagged; the owning coordinator
+		// cancels the run context and settles it.
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE submissions SET cancel_requested = 1 WHERE id = ?`,
+			submissionID); err != nil {
+			return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+		}
+		wasRunning = true
+	default: // terminalizing or settled — already terminal
+		return false, harness.ErrClaimLost
 	}
-	// A running submission is only flagged; the owning coordinator cancels
-	// the run context and settles it.
-	res, err = s.db.ExecContext(ctx, `
-		UPDATE submissions SET cancel_requested = 1
-		WHERE id = ? AND status = 'running'`,
-		submissionID)
-	if err != nil {
-		return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, fmt.Errorf("cancel %s commit: %w", submissionID, err)
 	}
-	affected, err = res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("cancel %s rows: %w", submissionID, err)
-	}
-	if affected == 1 {
-		return true, nil
-	}
-	// Missing, or terminalizing/settled — already terminal.
-	if err := s.submissionExists(ctx, submissionID); err != nil {
-		return false, err
-	}
-	return false, harness.ErrClaimLost
+	committed = true
+	return wasRunning, nil
 }
 
 // ReserveSettlement implements the corresponding harness.Store method; semantics

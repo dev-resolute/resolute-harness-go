@@ -38,6 +38,7 @@ func Run(t *testing.T, factory Factory) {
 		{"SettlementPhases", testSettlementPhases},
 		{"FinalizeIdempotent", testFinalizeIdempotent},
 		{"WaitAndResumeTransitions", testWaitAndResumeTransitions},
+		{"WaitingHeadBlocksSession", testWaitingHeadBlocksSession},
 		{"ChildListingAndWaitExpiry", testChildListingAndWaitExpiry},
 		{"CancelSubmissionTransitions", testCancelSubmissionTransitions},
 		{"ConversationEnsureAndGet", testConversationEnsureAndGet},
@@ -490,6 +491,42 @@ func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
 	}
 }
 
+func testWaitingHeadBlocksSession(t *testing.T, s harness.Store) {
+	ctx := ctxT(t)
+	head := admit(t, s, "default")
+	sibling := admit(t, s, "default")
+	claimed := claim(t, s, head)
+	if err := s.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: head.ID,
+		AttemptID:    claimed.AttemptID,
+	}); err != nil {
+		t.Fatalf("WaitSubmission: %v", err)
+	}
+
+	// The waiting head still occupies the session: its queued sibling is
+	// blocked behind it, not promoted.
+	runnable, err := s.ListRunnable(ctx)
+	if err != nil {
+		t.Fatalf("ListRunnable: %v", err)
+	}
+	if ids(runnable)[head.ID] || ids(runnable)[sibling.ID] {
+		t.Fatalf("runnable with waiting head = %v, want neither head %s nor sibling %s",
+			keys(ids(runnable)), head.ID, sibling.ID)
+	}
+
+	// Waking the head makes it runnable again.
+	if err := s.ResumeSubmission(ctx, head.ID); err != nil {
+		t.Fatalf("ResumeSubmission: %v", err)
+	}
+	runnable, err = s.ListRunnable(ctx)
+	if err != nil {
+		t.Fatalf("ListRunnable: %v", err)
+	}
+	if len(runnable) != 1 || runnable[0].ID != head.ID {
+		t.Fatalf("runnable after resume = %v, want [%s]", keys(ids(runnable)), head.ID)
+	}
+}
+
 func testChildListingAndWaitExpiry(t *testing.T, s harness.Store) {
 	ctx := ctxT(t)
 	parent := admit(t, s, "parent-session")
@@ -623,6 +660,9 @@ func testCancelSubmissionTransitions(t *testing.T, s harness.Store) {
 	if got.Status != harness.StatusSettled || got.LastError != "orphan cascade" {
 		t.Fatalf("cancelled waiting = (status %q, LastError %q), want (settled, orphan cascade)", got.Status, got.LastError)
 	}
+	if got.PendingResume || !got.WaitUntil.IsZero() {
+		t.Fatalf("cancelled waiting still marked: PendingResume=%v WaitUntil=%v", got.PendingResume, got.WaitUntil)
+	}
 
 	// Running: flagged for the owning coordinator, no status change.
 	running := claim(t, s, admit(t, s, "running-session"))
@@ -644,6 +684,32 @@ func testCancelSubmissionTransitions(t *testing.T, s harness.Store) {
 		t.Fatalf("CancelRequested = false, want true")
 	}
 
+	// Re-cancelling a running submission is idempotent: still flagged, still
+	// running, no error.
+	wasRunning, err = s.CancelSubmission(ctx, running.ID, "orphan cascade")
+	if err != nil {
+		t.Fatalf("CancelSubmission(running, again): %v", err)
+	}
+	if !wasRunning {
+		t.Fatalf("CancelSubmission(running, again) wasRunning = false, want true")
+	}
+	got, err = s.GetSubmission(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.Status != harness.StatusRunning || !got.CancelRequested {
+		t.Fatalf("re-cancelled running = (status %q, CancelRequested %v), want (running, true)", got.Status, got.CancelRequested)
+	}
+
+	// Terminalizing: the settlement CAS already won, the cancel loses.
+	terminalizing := claim(t, s, admit(t, s, "terminalizing-session"))
+	if err := s.ReserveSettlement(ctx, terminalizing.ID, terminalizing.AttemptID); err != nil {
+		t.Fatalf("ReserveSettlement: %v", err)
+	}
+	if _, err := s.CancelSubmission(ctx, terminalizing.ID, "too late"); !errors.Is(err, harness.ErrClaimLost) {
+		t.Fatalf("CancelSubmission(terminalizing) error = %v, want ErrClaimLost", err)
+	}
+
 	// Already terminal: the cancel CAS does not apply.
 	settled := claim(t, s, admit(t, s, "settled-session"))
 	if err := s.ReserveSettlement(ctx, settled.ID, settled.AttemptID); err != nil {
@@ -652,8 +718,8 @@ func testCancelSubmissionTransitions(t *testing.T, s harness.Store) {
 	if err := s.FinalizeSettlement(ctx, settled.ID); err != nil {
 		t.Fatalf("FinalizeSettlement: %v", err)
 	}
-	if _, err := s.CancelSubmission(ctx, settled.ID, "too late"); err == nil {
-		t.Fatalf("CancelSubmission(settled) = nil, want error (already terminal)")
+	if _, err := s.CancelSubmission(ctx, settled.ID, "too late"); !errors.Is(err, harness.ErrClaimLost) {
+		t.Fatalf("CancelSubmission(settled) error = %v, want ErrClaimLost (already terminal)", err)
 	}
 }
 
