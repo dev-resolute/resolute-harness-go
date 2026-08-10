@@ -51,13 +51,7 @@ func newTestProjection() (*projection, *fakeConvStore) {
 	return proj, store
 }
 
-// TestAppendBranchSummaryUsageRoundTrip covers AGENT-20's harness half: the
-// compaction record's Usage field must round-trip the summarization usage
-// agent-core reports on pi.BranchSummary, and must stay absent (no "usage"
-// key, decodes to nil) when the provider reported none.
-// TestProjectionSkipsTaskSpawned pins the projection-safety rule
-// (HARNESS-15): a task_spawned record in the log — and by extension any
-// non-message record kind — never leaks into the LLM-facing []pi.Message.
+// TestProjectionSkipsTaskSpawned pins the projection-safety rule (HARNESS-15): a task_spawned record — like any non-message record — never leaks into the LLM-facing []pi.Message.
 func TestProjectionSkipsTaskSpawned(t *testing.T) {
 	base := []Record{
 		{RecordEnvelope: RecordEnvelope{ID: "r1", Kind: KindConversationCreated, ConversationID: "conv-1"},
@@ -102,6 +96,10 @@ func TestProjectionSkipsTaskSpawned(t *testing.T) {
 	}
 }
 
+// TestAppendBranchSummaryUsageRoundTrip covers AGENT-20's harness half: the
+// compaction record's Usage field must round-trip the summarization usage
+// agent-core reports on pi.BranchSummary, and must stay absent (no "usage"
+// key, decodes to nil) when the provider reported none.
 func TestAppendBranchSummaryUsageRoundTrip(t *testing.T) {
 	t.Run("usage present", func(t *testing.T) {
 		proj, store := newTestProjection()

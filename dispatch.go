@@ -93,7 +93,11 @@ type Dispatch struct {
 	Message    DispatchMessage
 	// Parent, when set, marks the dispatch as a spawned child run
 	// (HARNESS-15); admission links the conversation and submission back to
-	// the parent run.
+	// the parent run. The link is partially honored when the target session
+	// key already has a conversation (EnsureConversation's not-created path,
+	// e.g. an idempotent re-drive): no new conversation_created is written,
+	// so ParentRef is not re-asserted, while the submission still records
+	// ParentSubmissionID/ParentCallID/Depth.
 	Parent *SpawnParent
 }
 
