@@ -40,7 +40,10 @@ func (c *coordinator) wakeParent(ctx context.Context, child Submission, payload 
 	// Append the parent's outcome for the pending call unless one already
 	// names the CallID — check-then-append like appendSettledRecordOnce. An
 	// existing outcome wins: an idempotent re-drive's reconciler may have
-	// synthesized one, and a re-wake must not double-author.
+	// synthesized one, and a re-wake must not double-author. The
+	// check-then-append idempotency relies on single-process wake
+	// serialization; multi-node duplicate-wake fencing is deferred (see
+	// docs/adr/0010-v1-scope-full-engine-semantics.md).
 	recs, err := c.rt.store.ReadRecords(ctx, parent.ConversationID, "")
 	if err != nil {
 		return fmt.Errorf("read parent records for wake: %w", err)
