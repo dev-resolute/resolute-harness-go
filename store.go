@@ -103,7 +103,11 @@ type SubmissionStore interface {
 	// AttemptCount. It returns ErrClaimLost when the submission is not
 	// queued. The claim consumes PendingResume: the returned row carries it
 	// (the drive branches Resume vs Prompt on it) while the stored row
-	// clears it.
+	// clears it. A resume claim (PendingResume set) does NOT increment
+	// AttemptCount: a resume re-drives a parked parent, not a failed
+	// attempt, so it never consumes the failure-attempt budget (and
+	// transientBackoff, which keys off AttemptCount, only ever reflects
+	// real failures).
 	ClaimSubmission(ctx context.Context, claim SubmissionClaim) (Submission, error)
 	// StartAttempt durably records the attempt marker. It is written after a
 	// successful claim and before any work.

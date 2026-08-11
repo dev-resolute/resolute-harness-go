@@ -92,7 +92,7 @@ rt, _ := harness.NewRuntime(harness.Config{
 
 The durability guarantees are the engine's own: a crash while waiting loses nothing — the suspension point and the child row are durable, the child keeps running under its own lease, and the settlement wake (replayed on the recovery path when it was missed) re-drives the parent; the waiting parent holds no lease and is excluded from the interrupted-running reclaim. A parent that settles with live children cascades cancellation to them (`OnParentTerminal`; v1 offers `CancelChildren` only).
 
-`SubagentLimits` bound the fan-out: `MaxChildrenPerRun` (default 8; excess calls get an immediate error result, never a suspension), `MaxDepth` (default 1 — children get no task tool, so cycles are impossible by construction), `MaxWait` (default 0 = unbounded; a lapsed wait lands an error outcome and cancels the children). See [`examples/triage`](examples/triage) for a runnable wiring.
+`SubagentLimits` bound the fan-out: `MaxChildrenPerRun` (default 8; excess calls get an immediate error result, never a suspension), `MaxDepth` (default 1 — children get no task tool, so cycles are impossible by construction), `MaxWait` (default 0 = unbounded; a lapsed wait lands an error outcome and cancels the children). There is no operator-facing cancel API yet — cancellation is engine-internal (the orphan cascade, wait expiry). See [`examples/triage`](examples/triage) for a runnable wiring.
 
 ## Examples
 

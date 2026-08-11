@@ -68,6 +68,156 @@ CREATE TABLE attachments (
 );
 `
 
+// schemaV1 is schemaV2 before the v2 last_error column landed (HARNESS-12).
+const schemaV1 = `
+CREATE TABLE conversations (
+	key         TEXT PRIMARY KEY,
+	id          TEXT NOT NULL UNIQUE,
+	agent       TEXT NOT NULL,
+	instance    TEXT NOT NULL,
+	session     TEXT NOT NULL,
+	created_at  TEXT NOT NULL
+);
+CREATE TABLE records (
+	seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+	id              TEXT NOT NULL UNIQUE,
+	conversation_id TEXT NOT NULL,
+	kind            TEXT NOT NULL,
+	json            BLOB NOT NULL
+);
+CREATE INDEX records_by_conversation ON records(conversation_id, id);
+CREATE TABLE submissions (
+	seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+	id               TEXT NOT NULL UNIQUE,
+	session_key      TEXT NOT NULL,
+	agent            TEXT NOT NULL,
+	instance         TEXT NOT NULL,
+	session          TEXT NOT NULL,
+	conversation_id  TEXT NOT NULL,
+	status           TEXT NOT NULL,
+	input_json       BLOB NOT NULL,
+	attempt_count    INTEGER NOT NULL DEFAULT 0,
+	attempt_id       TEXT NOT NULL DEFAULT '',
+	owner_id         TEXT NOT NULL DEFAULT '',
+	lease_expires_ns INTEGER NOT NULL DEFAULT 0,
+	created_at       TEXT NOT NULL
+);
+CREATE INDEX submissions_by_session ON submissions(session_key, seq);
+CREATE INDEX submissions_by_status ON submissions(status);
+CREATE TABLE attempts (
+	seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+	id            TEXT NOT NULL,
+	submission_id TEXT NOT NULL,
+	owner_id      TEXT NOT NULL,
+	started_at    TEXT NOT NULL
+);
+CREATE INDEX attempts_by_submission ON attempts(submission_id, seq);
+CREATE TABLE attachments (
+	digest     TEXT PRIMARY KEY,
+	media_type TEXT NOT NULL,
+	size       INTEGER NOT NULL,
+	data       BLOB NOT NULL
+);
+`
+
+// A v1 database opens under the current build: the migration chain gains
+// last_error (v1->v2) and then the six v3 columns in one transaction.
+func TestMigrationV1ToV3(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "harness.db")
+	ctx := context.Background()
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := raw.Exec(schemaV1); err != nil {
+		t.Fatalf("create v1 schema: %v", err)
+	}
+	if _, err := raw.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("stamp user_version 1: %v", err)
+	}
+	inputJSON, err := json.Marshal(harness.UserMessage("legacy input"))
+	if err != nil {
+		t.Fatalf("marshal input: %v", err)
+	}
+	createdAt := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	if _, err := raw.Exec(`
+		INSERT INTO submissions (id, session_key, agent, instance, session, conversation_id,
+			status, input_json, attempt_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"legacy-sub", "support/acme/legacy", "support", "acme", "legacy", "conv-legacy",
+		"queued", inputJSON, 1, createdAt.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close v1 db: %v", err)
+	}
+
+	store, err := sqlite.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	// user_version is stamped 3 and every migrated column exists.
+	check, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open (check): %v", err)
+	}
+	defer check.Close()
+	var version int
+	if err := check.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 3 {
+		t.Fatalf("user_version = %d, want 3", version)
+	}
+	rows, err := check.Query("PRAGMA table_info(submissions)")
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info: %v", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows: %v", err)
+	}
+	for _, col := range []string{
+		"last_error",
+		"parent_submission_id", "parent_call_id", "depth",
+		"pending_resume", "wait_until_ns", "cancel_requested",
+	} {
+		if !columns[col] {
+			t.Fatalf("submissions missing migrated column %q (have %v)", col, columns)
+		}
+	}
+
+	// The legacy row reads back with zero-valued new fields and its v1 data
+	// intact.
+	got, err := store.GetSubmission(ctx, "legacy-sub")
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if got.LastError != "" || got.ParentSubmissionID != "" || got.PendingResume || got.CancelRequested {
+		t.Fatalf("migrated row has non-zero new fields: %+v", got)
+	}
+	if got.Status != harness.StatusQueued || got.AttemptCount != 1 || !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("migrated row lost v1 data: %+v", got)
+	}
+}
+
 // A v2 database opens under the current build: the v2->v3 migration adds the
 // six new columns, stamps user_version 3, and leaves pre-existing rows
 // reading back with zero-valued new fields.

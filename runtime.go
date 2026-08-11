@@ -472,9 +472,11 @@ func (rt *Runtime) appendWait() <-chan struct{} {
 }
 
 // sessionBusy reports whether the session has unsettled work — the live
-// tail stays open while it does.
+// tail stays open while it does. Waiting counts: a parked parent's stream
+// must stay open through the quiet window so the wake outcome and resume
+// deltas land on the same connection.
 func (rt *Runtime) sessionBusy(ctx context.Context, key SessionKey) (bool, error) {
-	for _, status := range []SubmissionStatus{StatusQueued, StatusRunning, StatusTerminalizing} {
+	for _, status := range []SubmissionStatus{StatusQueued, StatusRunning, StatusWaiting, StatusTerminalizing} {
 		subs, err := rt.store.ListByStatus(ctx, status)
 		if err != nil {
 			return false, err

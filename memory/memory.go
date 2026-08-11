@@ -175,7 +175,14 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	sub.AttemptID = claim.AttemptID
 	sub.OwnerID = claim.OwnerID
 	sub.LeaseExpiresAt = claim.LeaseExpiresAt
-	sub.AttemptCount++
+	// A resume claim re-drives a parked parent — it is not a failure
+	// re-attempt, so it must not consume the failure-attempt budget (a
+	// parent may legally suspend/resume more than MaxAttempts times across
+	// a multi-wave fan-out). transientBackoff keys off AttemptCount, so the
+	// count must only ever reflect real failures.
+	if !sub.PendingResume {
+		sub.AttemptCount++
+	}
 	// The claim consumes PendingResume: the returned row carries it so the
 	// drive branches Resume vs Prompt on it; the stored row clears it, so a
 	// crash mid-resume re-drives as a plain prompt rather than resuming

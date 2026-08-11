@@ -501,12 +501,21 @@ func testWaitAndResumeTransitions(t *testing.T, s harness.Store) {
 	if !claimed.PendingResume {
 		t.Fatal("claimed row lost PendingResume; the resume drive cannot branch on it")
 	}
+	// A resume claim does not consume the failure-attempt budget: the first
+	// (prompt) claim above took the count to 1 and this resume claim leaves
+	// it there. A normal claim still increments (pinned in ClaimCAS).
+	if claimed.AttemptCount != 1 {
+		t.Fatalf("resume claim AttemptCount = %d, want 1 (a resume is not a failure re-attempt)", claimed.AttemptCount)
+	}
 	got, err = s.GetSubmission(ctx, sub.ID)
 	if err != nil {
 		t.Fatalf("GetSubmission: %v", err)
 	}
 	if got.PendingResume {
 		t.Fatal("stored row still marked PendingResume after the claim consumed it")
+	}
+	if got.AttemptCount != 1 {
+		t.Fatalf("stored AttemptCount = %d after resume claim, want 1", got.AttemptCount)
 	}
 }
 

@@ -36,6 +36,10 @@ var errDeadlineHalted = errors.New("durability timeout reached mid-run")
 // orphan cascade (HARNESS-15) interrupts the orphaned child's attempt.
 var errParentCancelled = errors.New("parent settled; orphaned run cancelled")
 
+// errWaitExpired cancels a run whose parent's bounded wait lapsed — the
+// wait-expiry scan (HARNESS-15) interrupts the running child.
+var errWaitExpired = errors.New("parent wait expired; run cancelled")
+
 // danglingToolCallMessage is the harness-owned synthesized tool_outcome
 // content for a tool call recovered with no result: the process crashed
 // between the durable assistant_tool_call record and its tool_outcome, so
@@ -255,9 +259,10 @@ func (c *coordinator) expireWaits(ctx context.Context) {
 // expireWait ends one lapsed wait: the children still in flight are
 // cancelled, each spawned call still lacking an outcome gets the
 // wait-expired error outcome, and the parent is requeued so its re-drive
-// sees the failure as the call's result. Cancelling a running child only
-// sets CancelRequested (the orphan cascade, Task 11, owns running-child
-// termination); either way the parent's outcome no longer waits on it.
+// sees the failure as the call's result. A running child is flagged via
+// CancelSubmission AND its in-process run context cancelled (same
+// mechanics as the orphan cascade) — the flag alone would let the
+// in-flight run finish to completion.
 func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
 	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
 	if err != nil {
@@ -267,8 +272,12 @@ func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
 		if ch.Status == StatusSettled {
 			continue
 		}
-		if _, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent wait expired"); err != nil && !errors.Is(err, ErrClaimLost) {
+		wasRunning, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent wait expired")
+		if err != nil && !errors.Is(err, ErrClaimLost) {
 			return fmt.Errorf("cancel child %s for wait expiry: %w", ch.ID, err)
+		}
+		if err == nil && wasRunning {
+			c.cancelLiveRun(ch.ID, errWaitExpired)
 		}
 	}
 
@@ -638,6 +647,15 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 			Error:     "cancelled: parent settled",
 			ErrorCode: SettledErrCancelled,
 		}, logger)
+	case errors.Is(context.Cause(runCtx), errWaitExpired):
+		// The wait-expiry scan cancelled the run (the parent's bounded wait
+		// lapsed): settle cancelled — the same path as the orphan cascade
+		// above, carrying the expiry reason.
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent wait expired",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
 	case runErr != nil && ctx.Err() != nil:
 		// Shutdown interrupted the attempt: release the claim so a fresh
 		// Runtime (or this store's next owner) re-attempts immediately.
@@ -785,25 +803,32 @@ func (c *coordinator) cancelChildren(ctx context.Context, parent Submission) {
 			continue
 		}
 		if wasRunning {
-			c.runsMu.Lock()
-			cancel, ok := c.runs[ch.ID]
-			c.runsMu.Unlock()
-			if ok {
-				cancel(errParentCancelled)
-			} else {
-				// Claim→register window (or another process owns the run):
-				// the flag stands. Backstops: runSubmission's claim-start
-				// check and post-register re-read settle the row cancelled
-				// if this process claimed it; reclaimExpired settles it if
-				// the owner is dead.
-				c.rt.logger.Warn("child flagged but no live run registered; claim-start check, post-register re-check, or reclaim will settle it", "child", ch.ID)
-			}
+			c.cancelLiveRun(ch.ID, errParentCancelled)
 			continue
 		}
 		// Queued/waiting: no attempt will run — CancelSubmission settled
 		// the row already, so land the settled record directly.
 		c.settleCancelledChild(ctx, ch)
 	}
+}
+
+// cancelLiveRun interrupts the in-process run of a child flagged running
+// by CancelSubmission (the orphan cascade with errParentCancelled, wait
+// expiry with errWaitExpired); the child's own post-drive switch settles
+// it cancelled. The registry is v1-single-process (ADR-0010): when no run
+// is registered — the claim→register window, or another process owns the
+// run — the flag stands and the backstops settle it (runSubmission's
+// claim-start check and post-register re-read if this process claimed it,
+// reclaimExpired if the owner is dead).
+func (c *coordinator) cancelLiveRun(childID string, cause error) {
+	c.runsMu.Lock()
+	cancel, ok := c.runs[childID]
+	c.runsMu.Unlock()
+	if ok {
+		cancel(cause)
+		return
+	}
+	c.rt.logger.Warn("child flagged but no live run registered; claim-start check, post-register re-check, or reclaim will settle it", "child", childID)
 }
 
 // settleCancelledChild settles a cascade-cancelled child whose row the

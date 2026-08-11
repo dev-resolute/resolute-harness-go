@@ -125,33 +125,10 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("stamp schema version in %s: %w", path, err)
 		}
-	case 1:
-		// v1 -> v2: submissions gained last_error (HARNESS-12).
-		if _, err := db.Exec("ALTER TABLE submissions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+	case 1, 2:
+		if err := migrateToV3(db, path, version); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("migrate schema v1->v2 in %s: %w", path, err)
-		}
-		fallthrough
-	case 2:
-		// v2 -> v3: submissions gained the parent-link and waiting-state
-		// columns (HARNESS-15).
-		for _, stmt := range []string{
-			"ALTER TABLE submissions ADD COLUMN parent_submission_id TEXT NOT NULL DEFAULT ''",
-			"ALTER TABLE submissions ADD COLUMN parent_call_id TEXT NOT NULL DEFAULT ''",
-			"ALTER TABLE submissions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
-			"ALTER TABLE submissions ADD COLUMN pending_resume INTEGER NOT NULL DEFAULT 0",
-			"ALTER TABLE submissions ADD COLUMN wait_until_ns INTEGER NOT NULL DEFAULT 0",
-			"ALTER TABLE submissions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
-			"CREATE INDEX IF NOT EXISTS submissions_by_parent ON submissions(parent_submission_id)",
-		} {
-			if _, err := db.Exec(stmt); err != nil {
-				db.Close()
-				return nil, fmt.Errorf("migrate schema v2->v3 in %s: %w", path, err)
-			}
-		}
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("stamp schema version in %s: %w", path, err)
+			return nil, err
 		}
 	case schemaVersion:
 		// Supported.
@@ -161,6 +138,49 @@ func Open(path string) (*Store, error) {
 			path, version, schemaVersion, harness.ErrUnsupportedSchema)
 	}
 	return &Store{db: db}, nil
+}
+
+// migrateToV3 upgrades a v1 or v2 database to the current schema inside a
+// single transaction: a crash mid-migration rolls back to the pre-migration
+// version instead of wedging the DB between versions (some ALTERs applied,
+// user_version unstamped). v1 falls through to the v2 step after gaining
+// last_error.
+func migrateToV3(db *sql.DB, path string, from int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema migration in %s: %w", path, err)
+	}
+	defer tx.Rollback()
+	if from == 1 {
+		// v1 -> v2: submissions gained last_error (HARNESS-12).
+		if _, err := tx.Exec("ALTER TABLE submissions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate schema v1->v2 in %s: %w", path, err)
+		}
+	}
+	// v2 -> v3: submissions gained the parent-link and waiting-state
+	// columns (HARNESS-15).
+	for _, stmt := range []string{
+		"ALTER TABLE submissions ADD COLUMN parent_submission_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE submissions ADD COLUMN parent_call_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE submissions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN pending_resume INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN wait_until_ns INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+		"CREATE INDEX IF NOT EXISTS submissions_by_parent ON submissions(parent_submission_id)",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate schema v2->v3 in %s: %w", path, err)
+		}
+	}
+	// user_version participates in the transaction (unlike journal_mode),
+	// so the stamp commits or rolls back with the ALTERs.
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return fmt.Errorf("stamp schema version in %s: %w", path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration in %s: %w", path, err)
+	}
+	return nil
 }
 
 // Close releases the underlying database.
@@ -416,9 +436,13 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	if err := s.db.QueryRowContext(ctx, `SELECT pending_resume FROM submissions WHERE id = ?`, claim.SubmissionID).Scan(&pendingResume); err != nil {
 		return harness.Submission{}, fmt.Errorf("read pending resume for claim %s: %w", claim.SubmissionID, err)
 	}
+	// A resume claim (pending_resume set) does not increment attempt_count:
+	// it re-drives a parked parent, not a failed attempt (see the memory
+	// store). SET expressions evaluate against the pre-update row.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'running', attempt_id = ?, owner_id = ?,
-			lease_expires_ns = ?, attempt_count = attempt_count + 1, pending_resume = 0
+			lease_expires_ns = ?, attempt_count = attempt_count + CASE WHEN pending_resume = 0 THEN 1 ELSE 0 END,
+			pending_resume = 0
 		WHERE id = ? AND status = 'queued'`,
 		claim.AttemptID, claim.OwnerID, claim.LeaseExpiresAt.UnixNano(), claim.SubmissionID)
 	if err != nil {

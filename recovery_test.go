@@ -567,6 +567,53 @@ func TestReconcilerSynthesizesAfterChildSettledWithoutOutcome(t *testing.T) {
 	}
 }
 
+// A bounded wait that lapses while the child is MID-RUN must not let the
+// flagged child run to completion: the expiry scan cancels the in-process
+// run context (errWaitExpired), the child's own post-drive switch settles
+// it cancelled with the expiry reason, and the parent resumes on an error
+// outcome for the outstanding call.
+func TestWaitExpiryCancelsRunningChild(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := memory.New()
+
+	parentProv := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{textTurn("handled the expiry")}}
+	childGate := make(chan struct{})
+	childProv := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{textTurn("child answer")}, gates: []<-chan struct{}{childGate}}
+	rt := startRuntime(t, subagentConfig(store, parentProv, childProv, harness.SubagentLimits{}))
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Seed after startup so the full wait window is available for the claim:
+	// the child is claimed and streaming (gated) before the wait lapses.
+	_, parent, childConv, child := seedParkedParent(t, store, time.Now().Add(500*time.Millisecond))
+	waitForRequests(t, childProv, 1)
+
+	parentSettled, err := rt.Wait(wctx, parent.ID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledSucceeded {
+		t.Fatalf("parent settled = %+v, want succeeded (the error outcome resumes, not fails, the parent)", parentSettled)
+	}
+
+	// The gated child never produced its answer: the expiry scan cancelled
+	// its run context and its own settle landed cancelled with the reason.
+	childSettled := waitForSettledRecord(t, rt, childConv.ID, child.ID)
+	if childSettled.Status != harness.SettledFailed || childSettled.ErrorCode != harness.SettledErrCancelled {
+		t.Errorf("child settled = %+v, want failed/cancelled", childSettled)
+	}
+	if childSettled.Error != "cancelled: parent wait expired" {
+		t.Errorf("child settled error = %q, want %q", childSettled.Error, "cancelled: parent wait expired")
+	}
+	if n := len(childProv.requests()); n != 1 {
+		t.Errorf("child provider calls = %d, want 1 (cancelled mid-run, never retried)", n)
+	}
+	if n := len(parentProv.requests()); n != 1 {
+		t.Errorf("parent provider calls = %d, want 1 (the resume drive seeing the failure)", n)
+	}
+}
+
 // A bounded wait that lapses with the child still in flight ends the
 // suspension: the scan cancels the child, lands an error tool_outcome for
 // the outstanding spawned call, and requeues the parent so its re-drive
