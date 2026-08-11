@@ -12,7 +12,9 @@ _Avoid:_ agent config (that's the function's *result*), agent template.
 **Session** — a named conversation inside an instance (default name `"default"`). Public surface: `Prompt`, `Compact`, `Steer`, `FollowUp`.
 _Avoid:_ thread, chat.
 
-**Operation** — one typed unit of session work (`Prompt` | `Compact`; later `Task`, `Shell`). An operation spans one or more turns.
+**Operation** — one typed unit of session work (`Prompt` | `Compact` | `Task`; later `Shell`). An operation spans one or more turns.
+
+**Task operation** — the third `Operation` kind (HARNESS-15): one durable child run admitted from inside a parent's turn via the injected `task` tool.
 
 **Turn** — one `pi.Agent` LLM round-trip inside an operation. The harness never implements turn mechanics; agent-core owns them.
 
@@ -32,6 +34,16 @@ _Avoid:_ job, task (conflicts with the future `Task` operation).
 **Attempt** — one execution try of a submission. Attempt markers prove an attempt started; budgets (max attempts, timeout) are recomputed from durable history.
 
 **Settlement** — the two-phase terminal transition (`ReserveSettlement` → `FinalizeSettlement`) guaranteeing exactly one durable terminal record.
+
+**Spawn** — admission of a child submission by the `task` tool; exactly-once via `DispatchID = parentSubmissionID + ":" + callID`.
+
+**Suspension point** — a tool call with no outcome yet; the pending `assistant_tool_call` record is durable while the child runs.
+
+**Waiting** — the submission state between running and terminalizing: `queued → running → waiting → running → terminalizing → settled`. No lease, no heartbeat, excluded from the interrupted-running reclaim; resume drives don't consume the failure budget.
+
+**Wake** — the settlement hand-off: a settling child appends the parent's `tool_outcome` and requeues it once its last child settles. The second sanctioned out-of-band record author after the dangling-call reconciler.
+
+**Parent link** — `Submission.ParentSubmissionID`/`ParentCallID` plus `ConversationCreatedPayload.ParentRef` on the child conversation.
 
 **Reconciliation** — covers two scans, both idempotent and both replaying-safe: the *startup* scan that hands interrupted `running` submissions to fresh attempts, and the *dangling-call* scan (`reconcileDanglingToolCalls`) that runs on every drive to synthesize an error `tool_outcome` for any `assistant_tool_call` left on the active leaf path with no matching outcome — conversation-scoped, not submission-scoped, so it also catches a call left dangling by an earlier submission that already settled failed.
 

@@ -42,6 +42,13 @@
 // Set GEMINI_API_KEY (and optionally MODEL) to triage with the real model
 // instead; real models usually conform on the first try, so the corrective
 // turn only appears when they slip.
+//
+// The example also wires durable subagents (HARNESS-15): a "researcher"
+// lookup definition the triage agent may spawn via the injected task tool.
+// The keyless stand-in providers never call it, so the runbook above behaves
+// exactly as before; with a real model, a report that needs a lookup can
+// fan out to a durable child run whose final answer lands as the task call's
+// tool result.
 package main
 
 import (
@@ -86,10 +93,14 @@ func run() error {
 
 	rt, err := harness.NewRuntime(harness.Config{
 		Agents: map[string]harness.AgentDefinition{
-			"triage": {Initialize: initializeTriage},
+			"triage":     {Description: "Classify bug reports into a validated severity/component result", Initialize: initializeTriage},
+			"researcher": {Description: "Look up known issues and product facts; answer concisely", Initialize: initializeResearcher},
 		},
-		Store:  store,
-		Logger: logger,
+		// The triage agent may spawn researcher children via the injected
+		// task tool; researcher has no policy entry, so it gets none.
+		Subagents: harness.SubagentPolicy{"triage": {"researcher"}},
+		Store:     store,
+		Logger:    logger,
 		// Narrate settlements: schema failures surface here as
 		// failed/result_schema_invalid. The corrective turns themselves are
 		// canonical user_message records, visible in the SSE stream.
@@ -128,9 +139,21 @@ func run() error {
 }
 
 func initializeTriage(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
-	cfg := harness.AgentRuntimeConfig{
-		SystemPrompt: "You are a bug-triage agent. Classify incoming bug reports. When asked for a structured result, answer with the JSON only.",
-	}
+	return wireConfig(env,
+		"You are a bug-triage agent. Classify incoming bug reports. When asked for a structured result, answer with the JSON only. You can delegate lookups (known issues, product facts) to the researcher agent via the task tool.",
+		&stubbornProvider{}, "local/triage-prose-1")
+}
+
+func initializeResearcher(ctx context.Context, id harness.InstanceID, env harness.Env) (harness.AgentRuntimeConfig, error) {
+	return wireConfig(env,
+		"You are a lookup helper. Answer the question you are given directly and concisely; no preamble.",
+		&lookupProvider{}, "local/researcher-lookup-1")
+}
+
+// wireConfig is the provider wiring both definitions share: Gemini when
+// GEMINI_API_KEY is set, otherwise the given keyless stand-in.
+func wireConfig(env harness.Env, systemPrompt string, keyless llm.LLMProvider, keylessModel string) (harness.AgentRuntimeConfig, error) {
+	cfg := harness.AgentRuntimeConfig{SystemPrompt: systemPrompt}
 	if key := env.Secret("GEMINI_API_KEY"); key != "" {
 		provider, err := gemini.New(gemini.Config{APIKey: key})
 		if err != nil {
@@ -141,8 +164,8 @@ func initializeTriage(ctx context.Context, id harness.InstanceID, env harness.En
 		cfg.ContextWindow = 1_000_000
 		return cfg, nil
 	}
-	cfg.Providers = []llm.LLMProvider{&stubbornProvider{}}
-	cfg.Model = "local/triage-prose-1"
+	cfg.Providers = []llm.LLMProvider{keyless}
+	cfg.Model = keylessModel
 	cfg.ContextWindow = 100_000
 	return cfg, nil
 }
@@ -183,6 +206,23 @@ func (*stubbornProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.Eve
 			return nil, fmt.Errorf("marshal classification: %w", err)
 		}
 		return respondText(req, emit, string(answer))
+	})
+}
+
+// lookupProvider is the researcher's keyless stand-in: one canned lookup
+// answer, so a delegated task call still settles deterministically without
+// a model.
+type lookupProvider struct{}
+
+func (*lookupProvider) Name() string { return "local" }
+
+func (*lookupProvider) Capabilities(string) llm.ProviderCapabilities {
+	return llm.ProviderCapabilities{Streaming: true}
+}
+
+func (*lookupProvider) Stream(ctx context.Context, req llm.LLMRequest) llm.EventStream {
+	return llm.Run(ctx, req, func(ctx context.Context, req llm.LLMRequest, emit func(llm.LLMEvent) error, _ map[string]string, _ func(int, map[string]string)) ([]llm.Message, error) {
+		return respondText(req, emit, "Lookup complete: no matching known issue; the report is consistent with an unpatched regression.")
 	})
 }
 
