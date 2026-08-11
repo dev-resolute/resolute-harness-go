@@ -13,19 +13,6 @@ import (
 	"github.com/dev-resolute/resolute-harness-go/memory"
 )
 
-// waitForCondition polls until cond holds, failing the test after 10s.
-func waitForCondition(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.After(10 * time.Second)
-	for !cond() {
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", what)
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-}
-
 // callRecordIndex returns the index of the first record of the given kind
 // naming callID in its payload, or -1.
 func callRecordIndex(t *testing.T, recs []harness.Record, kind harness.RecordKind, callID string) int {
@@ -158,9 +145,9 @@ func TestSubagentEndToEnd(t *testing.T) {
 			t.Error("waiting parent is runnable — a waiting submission must free its worker")
 		}
 	}
-	waitForCondition(t, "both children streaming while the parent is parked", func() bool {
+	waitFor(t, func() bool {
 		return len(researcher.requests()) == 1 && len(billing.requests()) == 1
-	})
+	}, "timed out waiting for both children streaming while the parent is parked")
 
 	// (3) Two child submissions, each linked back to the call that spawned
 	// it, at depth 1, with the derived instance and dispatch IDs.
@@ -225,7 +212,7 @@ func TestSubagentEndToEnd(t *testing.T) {
 		t.Fatalf("tool_outcome records = %d, want 0 while both children are unsettled", n)
 	}
 
-	// (4, cont.) Release the researcher first: its wake lands outcome-1 but
+	// (4) Release the researcher first: its wake lands outcome-1 but
 	// does NOT requeue while billing is in flight. Then billing: the last
 	// wake lands outcome-2 and requeues the parent.
 	close(researchGate)
@@ -259,7 +246,7 @@ func TestSubagentEndToEnd(t *testing.T) {
 		t.Fatalf("parent settled = %+v, want succeeded after the wake re-drive", parentSettled)
 	}
 
-	// (4) The full causal chain on the parent conversation:
+	// (4, cont.) The full causal chain on the parent conversation:
 	// user_message → call-1 → call-2 → {spawn-1, spawn-2} → outcome-1 →
 	// outcome-2 → assistant final text → settled.
 	recs, err := rt.Records(ctx, res.ConversationID, "")
@@ -309,7 +296,7 @@ func TestSubagentEndToEnd(t *testing.T) {
 		t.Errorf("outcome-2 = %+v, want the billing child's final text", outcome2)
 	}
 
-	// (6) The parent's final answer incorporates both child answers and
+	// (5) The parent's final answer incorporates both child answers and
 	// lands after both outcomes, followed by the settled record.
 	finalIdx := -1
 	var finalBody string
@@ -340,7 +327,7 @@ func TestSubagentEndToEnd(t *testing.T) {
 		t.Errorf("settled record at %d, want it after the final assistant text at %d", settledIdx, finalIdx)
 	}
 
-	// (5) The resume drive's provider request — the parent's second call —
+	// (6) The resume drive's provider request — the parent's second call —
 	// carries both tool results in original call order, with no re-appended
 	// input.
 	reqs := parent.requests()
