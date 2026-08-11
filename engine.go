@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,12 +32,25 @@ var errLeaseLost = errors.New("lease lost to another attempt")
 // (cooperative halt at a turn boundary).
 var errDeadlineHalted = errors.New("durability timeout reached mid-run")
 
+// errParentCancelled cancels a run whose parent settled terminally — the
+// orphan cascade (HARNESS-15) interrupts the orphaned child's attempt.
+var errParentCancelled = errors.New("parent settled; orphaned run cancelled")
+
+// errWaitExpired cancels a run whose parent's bounded wait lapsed — the
+// wait-expiry scan (HARNESS-15) interrupts the running child.
+var errWaitExpired = errors.New("parent wait expired; run cancelled")
+
 // danglingToolCallMessage is the harness-owned synthesized tool_outcome
 // content for a tool call recovered with no result: the process crashed
 // between the durable assistant_tool_call record and its tool_outcome, so
 // the outcome is genuinely unknown. Byte-exact (HARNESS-14; harness half of
 // upstream #6285) — this string is not an upstream port.
 const danglingToolCallMessage = "Tool call was interrupted before a result was recorded (the run was recovered). Re-issue the tool call if it is still needed."
+
+// waitExpiredMessage is the harness-owned error tool_outcome content for a
+// spawned task call whose parent's bounded wait lapsed before the child
+// settled (HARNESS-15 wait expiry).
+const waitExpiredMessage = "task wait expired"
 
 // overflowCompactRetries bounds the in-attempt overflow ladder: each
 // overflow triggers one compact-and-retry, at most this many times.
@@ -58,6 +72,12 @@ type coordinator struct {
 
 	mu     sync.Mutex
 	active map[string]bool // session keys with a run in flight in this process
+
+	// runs maps a live attempt's submission ID to its run-context cancel,
+	// so the orphan cascade can interrupt a running child of this process
+	// (v1 single-process; multi-node fencing is deferred, ADR-0010).
+	runsMu sync.Mutex
+	runs   map[string]context.CancelCauseFunc
 }
 
 func newCoordinator(rt *Runtime) *coordinator {
@@ -65,6 +85,7 @@ func newCoordinator(rt *Runtime) *coordinator {
 		rt:      rt,
 		ownerID: newULID(),
 		active:  make(map[string]bool),
+		runs:    make(map[string]context.CancelCauseFunc),
 	}
 }
 
@@ -72,6 +93,11 @@ func newCoordinator(rt *Runtime) *coordinator {
 // cancelled. It wakes on admission nudges and on a steady tick.
 func (c *coordinator) loop(ctx context.Context) {
 	c.reconcile(ctx)
+	// One startup pass at reconcile cadence: a wait that lapsed while the
+	// process was down must cancel its still-queued children before the
+	// first claimRunnable can pick them up. Inside the loop the scans are
+	// gated to ticker iterations (see below).
+	c.expireWaits(ctx)
 	ticker := time.NewTicker(c.rt.claimInterval)
 	defer ticker.Stop()
 	for {
@@ -82,6 +108,12 @@ func (c *coordinator) loop(ctx context.Context) {
 			return
 		case <-c.rt.wake:
 		case <-ticker.C:
+			// The wait scans are O(waiting-parents × log-size) per run, so
+			// they fire on ticker cadence only — on every nudge they would
+			// serialize against run goroutines on single-connection stores
+			// (sqlite SetMaxOpenConns(1)). reclaimExpired stays on nudges:
+			// its queries are O(1).
+			c.expireWaits(ctx)
 		}
 	}
 }
@@ -110,22 +142,36 @@ func (c *coordinator) reconcile(ctx context.Context) {
 // is honored; otherwise the outcome is unknowable and the submission settles
 // failed with the indeterminate code.
 func (c *coordinator) finalizeInterrupted(ctx context.Context, sub Submission) error {
-	if err := c.appendSettledRecordOnce(ctx, sub, SettledPayload{
+	effective, err := c.appendSettledRecordOnce(ctx, sub, SettledPayload{
 		Status:    SettledFailed,
 		Error:     "process crashed during settlement; run outcome unknown",
 		ErrorCode: SettledErrIndeterminate,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
 		return fmt.Errorf("finalize settlement: %w", err)
+	}
+	if sub.ParentSubmissionID != "" {
+		// Re-run the wake after finalization, as settle() does: a sibling
+		// settling concurrently may have seen this submission still
+		// terminalizing and skipped the requeue. Idempotent — the outcome
+		// record exists by now, and a duplicate ResumeSubmission loses its
+		// CAS.
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
+			return fmt.Errorf("wake parent after finalize: %w", err)
+		}
 	}
 	c.rt.notifySettled()
 	return nil
 }
 
 // reclaimExpired releases running submissions whose lease expired — a
-// crashed or wedged owner — so the normal claim path re-attempts them.
+// crashed or wedged owner — so the normal claim path re-attempts them. A
+// flagged (CancelRequested) row is instead settled cancelled: the dead
+// owner's run cancel never landed, and re-queueing the row would defeat
+// the cancel.
 func (c *coordinator) reclaimExpired(ctx context.Context) {
 	expired, err := c.rt.store.ListExpiredLeases(ctx, time.Now())
 	if err != nil {
@@ -150,9 +196,254 @@ func (c *coordinator) reclaimExpired(ctx context.Context) {
 			continue
 		}
 		if err == nil {
+			if sub.CancelRequested {
+				// Flagged for cancel (orphan cascade or wait expiry) but the
+				// owner's run cancel never landed. Release moved the row to
+				// queued; cancel settles it outright. No interleaved claim can
+				// win between the two v1-single-process: reclaim runs on the
+				// claim-loop goroutine.
+				if _, cerr := c.rt.store.CancelSubmission(ctx, sub.ID, "cancelled: parent settled"); cerr != nil {
+					// The row stays queued and flagged; the claim path
+					// (runSubmission) settles it instead.
+					c.rt.logger.Error("cancel reclaimed flagged submission", "submission", sub.ID, "error", cerr)
+					continue
+				}
+				c.settleCancelledChild(ctx, sub)
+				continue
+			}
 			c.rt.logger.Info("reclaimed expired lease", "submission", sub.ID, "deadOwner", sub.OwnerID)
 		}
 	}
+}
+
+// expireWaits is the wait scan (HARNESS-15), gated to ticker iterations in
+// the claim loop — never to nudges — because its per-parent log reads are
+// O(waiting-parents × log-size). Two passes over parked parents:
+//
+//   - Expiry: a waiting submission whose WaitUntil lapsed can no longer pay
+//     off — its live children are cancelled, an error tool_outcome lands
+//     per outstanding spawned call, and it is requeued so the re-drive sees
+//     the failure.
+//   - Backstop: a waiting submission whose children ALL settled but which
+//     still lacks an outcome for a spawned call lost its wake to a crash
+//     window — the wake is re-run (wakeParent is idempotent; it no-ops
+//     when the outcome exists).
+func (c *coordinator) expireWaits(ctx context.Context) {
+	expired, err := c.rt.store.ListExpiredWaits(ctx, time.Now())
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("list expired waits", "error", err)
+		}
+		return
+	}
+	for _, sub := range expired {
+		if err := c.expireWait(ctx, sub); err != nil {
+			c.rt.logger.Error("expire wait", "submission", sub.ID, "error", err)
+		}
+	}
+
+	waiting, err := c.rt.store.ListByStatus(ctx, StatusWaiting)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rt.logger.Error("list waiting submissions", "error", err)
+		}
+		return
+	}
+	for _, sub := range waiting {
+		if err := c.backstopWake(ctx, sub); err != nil {
+			c.rt.logger.Error("backstop wake", "submission", sub.ID, "error", err)
+		}
+	}
+}
+
+// expireWait ends one lapsed wait: the children still in flight are
+// cancelled, each spawned call still lacking an outcome gets the
+// wait-expired error outcome, and the parent is requeued so its re-drive
+// sees the failure as the call's result. A running child is flagged via
+// CancelSubmission AND its in-process run context cancelled (same
+// mechanics as the orphan cascade) — the flag alone would let the
+// in-flight run finish to completion.
+func (c *coordinator) expireWait(ctx context.Context, sub Submission) error {
+	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
+	if err != nil {
+		return fmt.Errorf("list children for wait expiry: %w", err)
+	}
+	for _, ch := range children {
+		if ch.Status == StatusSettled {
+			continue
+		}
+		wasRunning, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent wait expired")
+		if err != nil && !errors.Is(err, ErrClaimLost) {
+			return fmt.Errorf("cancel child %s for wait expiry: %w", ch.ID, err)
+		}
+		if err == nil && wasRunning {
+			c.cancelLiveRun(ch.ID, errWaitExpired)
+		}
+	}
+
+	pending, err := c.pendingSpawnedCalls(ctx, sub)
+	if err != nil {
+		return err
+	}
+	if len(pending) > 0 {
+		// Re-check outcome existence immediately before appending: the
+		// natural wake (wakeParent) check-then-appends an outcome for the
+		// same CallID from another goroutine, so one can have landed since
+		// pendingSpawnedCalls read the log. This narrows the
+		// duplicate-outcome race window but does not close it — the
+		// eventual fix is a store-level guarded append (reject a second
+		// tool_outcome per CallID).
+		stillPending, err := c.pendingSpawnedCalls(ctx, sub)
+		if err != nil {
+			return err
+		}
+		open := make(map[string]bool, len(stillPending))
+		for _, callID := range stillPending {
+			open[callID] = true
+		}
+		outcomes := make([]Record, 0, len(pending))
+		for _, callID := range pending {
+			if !open[callID] {
+				continue // the wake landed this outcome concurrently
+			}
+			outcomes = append(outcomes, Record{
+				RecordEnvelope: RecordEnvelope{
+					ID:             newULID(),
+					Kind:           KindToolOutcome,
+					ConversationID: sub.ConversationID,
+					Session:        sub.SessionKey.Session,
+					SubmissionID:   sub.ID,
+					Time:           time.Now(),
+				},
+				Payload: mustPayload(&ToolOutcomePayload{
+					CallID:   callID,
+					ToolName: "task",
+					IsError:  true,
+					Content:  waitExpiredMessage,
+				}),
+			})
+		}
+		if len(outcomes) > 0 {
+			if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, outcomes); err != nil {
+				return fmt.Errorf("append wait-expiry outcomes: %w", err)
+			}
+			c.rt.notifyAppend()
+		}
+	}
+
+	if err := c.rt.store.ResumeSubmission(ctx, sub.ID); err != nil {
+		if errors.Is(err, ErrClaimLost) {
+			return nil // a wake already requeued it
+		}
+		return fmt.Errorf("requeue expired parent %s: %w", sub.ID, err)
+	}
+	// Nudge the claim loop without blocking (same as the wake).
+	select {
+	case c.rt.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// backstopWake re-runs the settlement wake for a waiting submission whose
+// children all settled — covering two lost-wake windows: the outcome for a
+// spawned call never landed (crash mid-wake), or the outcome landed but the
+// parent's ResumeSubmission was lost (the wake's requeue CAS repairs it).
+// wakeParent is idempotent — an existing outcome wins, a duplicate requeue
+// loses its CAS — so a submission whose wake fully landed costs only the
+// reads.
+func (c *coordinator) backstopWake(ctx context.Context, sub Submission) error {
+	children, err := c.rt.store.ListChildSubmissions(ctx, sub.ID)
+	if err != nil {
+		return fmt.Errorf("list children for wake backstop: %w", err)
+	}
+	if len(children) == 0 {
+		return nil
+	}
+	for _, ch := range children {
+		if ch.Status != StatusSettled {
+			return nil // still in flight — the wake fires at settlement
+		}
+	}
+	pending, err := c.pendingSpawnedCalls(ctx, sub)
+	if err != nil {
+		return err
+	}
+	for _, ch := range children {
+		// Wake unconditionally once all children are settled — the
+		// ResumeSubmission CAS is what repairs a lost requeue even when the
+		// outcome already landed. The payload (and its log read) is only
+		// needed while the outcome work for this call is still pending.
+		var payload SettledPayload
+		if slices.Contains(pending, ch.ParentCallID) {
+			var err error
+			payload, err = c.settledPayload(ctx, ch)
+			if err != nil {
+				return err
+			}
+		}
+		if err := c.wakeParent(ctx, ch, payload); err != nil {
+			return fmt.Errorf("backstop wake for child %s: %w", ch.ID, err)
+		}
+	}
+	return nil
+}
+
+// pendingSpawnedCalls returns, in spawn-record order, the call IDs of the
+// conversation's task_spawned records that have no tool_outcome yet.
+func (c *coordinator) pendingSpawnedCalls(ctx context.Context, sub Submission) ([]string, error) {
+	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
+	if err != nil {
+		return nil, fmt.Errorf("read records for wait scan: %w", err)
+	}
+	answered := make(map[string]bool)
+	for _, rec := range recs {
+		if rec.Kind != KindToolOutcome {
+			continue
+		}
+		var p ToolOutcomePayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return nil, fmt.Errorf("decode tool_outcome for wait scan: %w", err)
+		}
+		answered[p.CallID] = true
+	}
+	var pending []string
+	seen := make(map[string]bool)
+	for _, rec := range recs {
+		if rec.Kind != KindTaskSpawned {
+			continue
+		}
+		var sp TaskSpawnedPayload
+		if err := rec.DecodePayload(&sp); err != nil {
+			return nil, fmt.Errorf("decode task_spawned for wait scan: %w", err)
+		}
+		if answered[sp.CallID] || seen[sp.CallID] {
+			continue
+		}
+		seen[sp.CallID] = true
+		pending = append(pending, sp.CallID)
+	}
+	return pending, nil
+}
+
+// settledPayload reads back the submission_settled record of an
+// already-settled submission — the payload a backstop wake replays.
+func (c *coordinator) settledPayload(ctx context.Context, sub Submission) (SettledPayload, error) {
+	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
+	if err != nil {
+		return SettledPayload{}, fmt.Errorf("read records for settled payload: %w", err)
+	}
+	for _, rec := range recs {
+		if rec.Kind != KindSubmissionSettled || rec.SubmissionID != sub.ID {
+			continue
+		}
+		var p SettledPayload
+		if err := rec.DecodePayload(&p); err != nil {
+			return SettledPayload{}, fmt.Errorf("decode settled record: %w", err)
+		}
+		return p, nil
+	}
+	return SettledPayload{}, fmt.Errorf("settled submission %s has no settled record", sub.ID)
 }
 
 // claimRunnable claims every runnable submission whose session is not
@@ -231,6 +522,26 @@ func (c *coordinator) release(sessionKey string) {
 func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	logger := c.rt.logger.With("submission", sub.ID, "session", sub.SessionKey.String(), "attempt", sub.AttemptID)
 
+	// A row claimed with CancelRequested was flagged by the orphan cascade
+	// (or wait expiry) but its run cancel never landed — a shutdown
+	// released the flagged row, or the cascade found no registered run.
+	// Honor the flag: settle cancelled and never drive the attempt.
+	//
+	// The reason is approximate: CancelSubmission doesn't persist the
+	// cancel reason for running rows, so a flag from expireWait ("parent
+	// wait expired") also settles here — and at the post-register re-check
+	// and reclaim below — as "cancelled: parent settled" /
+	// cancelled_by_parent. Recording the true provenance needs a store
+	// change (the reason carried on the row); out of scope.
+	if sub.CancelRequested {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
+		return
+	}
+
 	def := c.rt.agents[sub.SessionKey.Agent]
 	cfg, err := def.Initialize(ctx, sub.SessionKey.Instance, c.rt.env)
 	if err == nil {
@@ -277,12 +588,42 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 
 	runCtx, cancelRun := context.WithCancelCause(ctx)
 	defer cancelRun(nil)
+	// Register the run's cancel so the orphan cascade can interrupt it when
+	// this submission's parent settles; deleted on exit.
+	c.runsMu.Lock()
+	c.runs[sub.ID] = cancelRun
+	c.runsMu.Unlock()
+	defer func() {
+		c.runsMu.Lock()
+		delete(c.runs, sub.ID)
+		c.runsMu.Unlock()
+	}()
+
+	// Close the claim→register window: a flag set after the claim-time
+	// snapshot but before this registry insert missed both the check
+	// above and the cascade's registry lookup. Re-read the row now that
+	// the registry covers us; if the flag landed in the gap, settle
+	// cancelled without driving.
+	fresh, err := c.rt.store.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		// The heartbeat's lease renewal and the reclaim remain as
+		// backstops if this read fails.
+		logger.Warn("post-register cancel re-check", "error", err)
+	} else if fresh.CancelRequested {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
+		return
+	}
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
 	var result json.RawMessage
+	var suspended bool
 	runErr := c.rt.intercept(runCtx, OpInfo{Kind: OpAttempt, Correlation: sub.correlation()}, func(cctx context.Context) error {
 		var derr error
-		result, derr = c.driveAttempt(cctx, sub, cfg, deadline)
+		result, suspended, derr = c.driveAttempt(cctx, sub, cfg, deadline)
 		return derr
 	})
 	cancelRun(nil)
@@ -295,6 +636,26 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		// Another attempt owns the submission now; ours must not settle or
 		// release.
 		logger.Warn("lease lost mid-run; abandoning attempt")
+	case errors.Is(context.Cause(runCtx), errParentCancelled):
+		// The orphan cascade cancelled the run (the parent settled
+		// terminally): settle cancelled — distinct from the shutdown arm
+		// below, which RELEASES for retry; an orphan has nothing to retry
+		// for. A result that raced the cancel is deliberately discarded:
+		// the parent is terminal, so the orphan's outcome is moot.
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
+	case errors.Is(context.Cause(runCtx), errWaitExpired):
+		// The wait-expiry scan cancelled the run (the parent's bounded wait
+		// lapsed): settle cancelled — the same path as the orphan cascade
+		// above, carrying the expiry reason.
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent wait expired",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
 	case runErr != nil && ctx.Err() != nil:
 		// Shutdown interrupted the attempt: release the claim so a fresh
 		// Runtime (or this store's next owner) re-attempts immediately.
@@ -340,6 +701,25 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status: SettledFailed, Error: runErr.Error(), ErrorCode: SettledErrRunFailed,
 		}, logger)
+	case suspended:
+		// The run suspended on a task call (HARNESS-15): park the
+		// submission in waiting — the lease is released and the worker
+		// freed — until a child settlement wakes it (Task 9).
+		if err := c.rt.store.WaitSubmission(ctx, SubmissionWait{
+			SubmissionID: sub.ID,
+			AttemptID:    sub.AttemptID,
+			WaitUntil:    c.rt.waitDeadline(),
+		}); err != nil {
+			if errors.Is(err, ErrClaimLost) {
+				// Lost the race with a reclaimer; abandon the attempt.
+				logger.Warn("wait transition lost; abandoning attempt", "error", err)
+				return
+			}
+			// The submission stays running; it recovers via lease expiry.
+			logger.Error("wait transition failed; submission stays running and recovers via lease expiry", "error", err)
+			return
+		}
+		c.rt.observe(SubmissionWaitingEvent{Correlation: sub.correlation()})
 	default:
 		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded, Result: result}, logger)
 	}
@@ -390,14 +770,95 @@ func (c *coordinator) settleAndNotify(ctx context.Context, sub Submission, paylo
 	}
 	c.rt.observe(SubmissionSettledEvent{Correlation: sub.correlation(), Payload: payload})
 	c.rt.notifySettled()
+	if c.rt.limits.OnParentTerminal == CancelChildren {
+		c.cancelChildren(ctx, sub)
+	}
+}
+
+// cancelChildren is the orphan cascade (HARNESS-15): a terminally settled
+// parent's live children are cancelled. A running child is flagged via
+// CancelSubmission and its in-process run context cancelled (the registry
+// is v1-single-process, ADR-0010); its own post-drive switch settles it
+// cancelled_by_parent. A queued or waiting child will never start an
+// attempt: CancelSubmission settles the row outright, so the settled
+// record lands here directly.
+//
+// No re-entry guard is needed at v1 MaxDepth=1: a settling child has no
+// children of its own, so the cascade cannot recurse back into itself.
+func (c *coordinator) cancelChildren(ctx context.Context, parent Submission) {
+	children, err := c.rt.store.ListChildSubmissions(ctx, parent.ID)
+	if err != nil {
+		c.rt.logger.Warn("list children for cascade", "submission", parent.ID, "error", err)
+		return
+	}
+	for _, ch := range children {
+		if ch.Status == StatusSettled {
+			continue
+		}
+		wasRunning, err := c.rt.store.CancelSubmission(ctx, ch.ID, "parent "+parent.ID+" settled")
+		if err != nil {
+			// ErrClaimLost included: the child went terminal between the
+			// list and the cancel; its own settle owns the record.
+			c.rt.logger.Warn("cancel child", "child", ch.ID, "error", err)
+			continue
+		}
+		if wasRunning {
+			c.cancelLiveRun(ch.ID, errParentCancelled)
+			continue
+		}
+		// Queued/waiting: no attempt will run — CancelSubmission settled
+		// the row already, so land the settled record directly.
+		c.settleCancelledChild(ctx, ch)
+	}
+}
+
+// cancelLiveRun interrupts the in-process run of a child flagged running
+// by CancelSubmission (the orphan cascade with errParentCancelled, wait
+// expiry with errWaitExpired); the child's own post-drive switch settles
+// it cancelled. The registry is v1-single-process (ADR-0010): when no run
+// is registered — the claim→register window, or another process owns the
+// run — the flag stands and the backstops settle it (runSubmission's
+// claim-start check and post-register re-read if this process claimed it,
+// reclaimExpired if the owner is dead).
+func (c *coordinator) cancelLiveRun(childID string, cause error) {
+	c.runsMu.Lock()
+	cancel, ok := c.runs[childID]
+	c.runsMu.Unlock()
+	if ok {
+		cancel(cause)
+		return
+	}
+	c.rt.logger.Warn("child flagged but no live run registered; claim-start check, post-register re-check, or reclaim will settle it", "child", childID)
+}
+
+// settleCancelledChild settles a cascade-cancelled child whose row the
+// store already moved to settled out of band (the queued/waiting arm of
+// cancelChildren, or a flagged row reclaimed after a missed run cancel):
+// it lands the settled record — bypassing settle's reservation, which
+// expects a running row — then observes and notifies like every other
+// settle path. The wake inside appendSettledRecordOnce is a guarded no-op:
+// the parent is settled by now.
+func (c *coordinator) settleCancelledChild(ctx context.Context, ch Submission) {
+	effective, err := c.appendSettledRecordOnce(ctx, ch, SettledPayload{
+		Status:    SettledFailed,
+		Error:     "cancelled: parent settled",
+		ErrorCode: SettledErrCancelled,
+	})
+	if err != nil {
+		c.rt.logger.Error("settle cancelled child", "child", ch.ID, "error", err)
+		return
+	}
+	c.rt.observe(SubmissionSettledEvent{Correlation: ch.correlation(), Payload: effective})
+	c.rt.notifySettled()
 }
 
 // driveAttempt runs the agent for one attempt, returning the validated
-// structured result (nil when none was requested) and the run error.
-func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) (json.RawMessage, error) {
+// structured result (nil when none was requested), whether the run
+// suspended on a task call, and the run error.
+func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg AgentRuntimeConfig, deadline time.Time) (json.RawMessage, bool, error) {
 	conv, err := c.rt.store.GetConversation(ctx, sub.SessionKey)
 	if err != nil {
-		return nil, fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
+		return nil, false, fmt.Errorf("resolve conversation for %s: %w", sub.SessionKey, err)
 	}
 	run := &submissionRun{
 		rt:       c.rt,
@@ -407,9 +868,9 @@ func (c *coordinator) driveAttempt(ctx context.Context, sub Submission, cfg Agen
 		deadline: deadline,
 	}
 	if err := run.drive(ctx); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return run.result, nil
+	return run.result, run.suspended, nil
 }
 
 // settle runs two-phase settlement: reserve the terminal transition, land
@@ -426,45 +887,75 @@ func (c *coordinator) settle(ctx context.Context, sub Submission, payload Settle
 	if err := c.rt.store.ReserveSettlement(ctx, sub.ID, sub.AttemptID); err != nil {
 		return fmt.Errorf("reserve settlement: %w", err)
 	}
-	if err := c.appendSettledRecordOnce(ctx, sub, payload); err != nil {
+	effective, err := c.appendSettledRecordOnce(ctx, sub, payload)
+	if err != nil {
 		return err
 	}
 	if err := c.rt.store.FinalizeSettlement(ctx, sub.ID); err != nil {
 		return fmt.Errorf("finalize settlement: %w", err)
+	}
+	if sub.ParentSubmissionID != "" {
+		// Re-run the wake after finalization: a sibling settling
+		// concurrently may have seen this submission still terminalizing
+		// and skipped the requeue. Whichever child finalizes last sees
+		// every sibling settled, so exactly one post-finalize wake
+		// requeues the parent. Idempotent — the outcome record exists by
+		// now, and a duplicate ResumeSubmission loses its CAS.
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
+			return fmt.Errorf("wake parent after finalize: %w", err)
+		}
 	}
 	return nil
 }
 
 // appendSettledRecordOnce appends the submission_settled record unless one
 // already exists for the submission — the idempotency half of two-phase
-// settlement.
-func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) error {
+// settlement. When the settling submission has a parent link, the wake
+// (HARNESS-15 settlement hand-off) runs inside the same reservation,
+// honoring an existing settled record's payload over the caller's (a
+// crash-recovery replay passes the indeterminate failure even when the
+// run's real outcome landed before the crash). It returns the effective
+// payload so the caller's post-finalize wake replays with the same one.
+func (c *coordinator) appendSettledRecordOnce(ctx context.Context, sub Submission, payload SettledPayload) (SettledPayload, error) {
 	recs, err := c.rt.store.ReadRecords(ctx, sub.ConversationID, "")
 	if err != nil {
-		return fmt.Errorf("read records before settle: %w", err)
+		return payload, fmt.Errorf("read records before settle: %w", err)
 	}
+	effective := payload
+	found := false
 	for _, rec := range recs {
 		if rec.Kind == KindSubmissionSettled && rec.SubmissionID == sub.ID {
-			return nil
+			found = true
+			if err := rec.DecodePayload(&effective); err != nil {
+				return payload, fmt.Errorf("decode existing settled record: %w", err)
+			}
+			break
 		}
 	}
-	rec := Record{
-		RecordEnvelope: RecordEnvelope{
-			ID:             newULID(),
-			Kind:           KindSubmissionSettled,
-			ConversationID: sub.ConversationID,
-			Session:        sub.SessionKey.Session,
-			SubmissionID:   sub.ID,
-			AttemptID:      sub.AttemptID,
-			Time:           time.Now(),
-		},
-		Payload: mustPayload(&payload),
+	if !found {
+		rec := Record{
+			RecordEnvelope: RecordEnvelope{
+				ID:             newULID(),
+				Kind:           KindSubmissionSettled,
+				ConversationID: sub.ConversationID,
+				Session:        sub.SessionKey.Session,
+				SubmissionID:   sub.ID,
+				AttemptID:      sub.AttemptID,
+				Time:           time.Now(),
+			},
+			Payload: mustPayload(&payload),
+		}
+		if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
+			return payload, fmt.Errorf("append settled record: %w", err)
+		}
+		c.rt.notifyAppend()
 	}
-	if err := c.rt.store.AppendRecords(ctx, sub.ConversationID, []Record{rec}); err != nil {
-		return fmt.Errorf("append settled record: %w", err)
+	if sub.ParentSubmissionID != "" {
+		if err := c.wakeParent(ctx, sub, effective); err != nil {
+			return payload, fmt.Errorf("wake parent: %w", err)
+		}
 	}
-	c.rt.notifyAppend()
-	return nil
+	return effective, nil
 }
 
 // submissionRun is the session engine for one attempt: it owns the pi.Agent,
@@ -488,6 +979,25 @@ type submissionRun struct {
 	// result is the validated structured result, set by drive when the
 	// prompt requested one.
 	result json.RawMessage
+
+	// suspended reports the prompt ended on a Suspend-marked call
+	// (HARNESS-15). Whether the attempt parks is decided in drive from
+	// durable child state (reconcileSpawnRecords): parking leaves this set
+	// and runSubmission waits the submission; a genuine bare Suspend from a
+	// non-task tool clears it and the run settles normally. Single-goroutine
+	// invariant: written in promptOnce/drive and read in drive/driveAttempt,
+	// all on the drive goroutine — unlike the mutex-guarded fields above it
+	// needs no lock.
+	suspended bool
+
+	// pendingSpawns counts the task_spawned records resolved for this
+	// attempt (authored by the consumer, or already durable from a prior
+	// admission). It feeds the park gate in reconcileSpawnRecords
+	// (children-existence || pendingSpawns; HARNESS-15 re-review) as
+	// belt-and-braces — the spawn payload rides agent-core's lossy event
+	// channel, so this count alone cannot be trusted. Same
+	// single-goroutine invariant as suspended.
+	pendingSpawns int
 
 	// Pending delta batch (accessed only from the event-consuming goroutine).
 	deltaKind    RecordKind
@@ -573,11 +1083,16 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		attemptID:    r.sub.AttemptID,
 		turnID:       r.currentTurnID,
 	}
+	tools := r.cfg.Tools
+	if targets := r.rt.subagentTargets(r.conv.Key.Agent, r.sub.Depth); len(targets) > 0 {
+		// Clone so the append cannot alias the definition's tool slice.
+		tools = append(slices.Clone(r.cfg.Tools), newTaskTool(r.rt, r, targets))
+	}
 	agent, err := pi.NewAgent(pi.AgentConfig{
 		Providers:          r.interceptedProviders(),
 		DefaultModel:       r.cfg.Model,
 		SystemPrompt:       r.cfg.SystemPrompt,
-		Tools:              r.interceptedTools(),
+		Tools:              r.interceptedTools(tools),
 		Skills:             r.cfg.Skills,
 		ReserveTokens:      r.cfg.ReserveTokens,
 		KeepRecentTokens:   r.cfg.KeepRecentTokens,
@@ -608,8 +1123,36 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	r.rt.registerLiveRun(r.conv.Key, agent)
 	defer r.rt.unregisterLiveRun(r.conv.Key)
 
-	if err := r.runRecovered(ctx, agent, inputToMessage(r.sub.Input)); err != nil {
+	// A submission claimed with PendingResume was woken from a suspension
+	// (HARNESS-15): the wake landed the pending call's tool_outcome before
+	// the requeue, so the transcript tail is a tool result and the drive
+	// Resumes instead of re-prompting the input. A resumed turn can suspend
+	// again (more children) — the suspended flag propagates as on a prompt
+	// drive.
+	if r.sub.PendingResume {
+		err = r.runRecovered(ctx, agent, r.runResume)
+	} else {
+		err = r.runRecovered(ctx, agent, func(c context.Context, a *pi.Agent) error {
+			return r.runPrompt(c, a, inputToMessage(r.sub.Input))
+		})
+	}
+	if err != nil {
 		return err
+	}
+	if r.suspended {
+		// Park-time reconciliation (HARNESS-15 re-review): repair any spawn
+		// record the lossy event channel dropped, from durable child state,
+		// then decide. Parking skips result validation — no final answer
+		// this attempt; a genuine bare suspend falls through and settles
+		// normally.
+		park, err := r.reconcileSpawnRecords(ctx)
+		if err != nil {
+			return err
+		}
+		if park {
+			return nil
+		}
+		r.suspended = false
 	}
 	if len(r.sub.Input.ResultSchema) > 0 {
 		return r.validateResultLoop(ctx, agent)
@@ -617,18 +1160,26 @@ func (r *submissionRun) drive(ctx context.Context) error {
 	return nil
 }
 
-// runRecovered is the turn-recovery ladder around one prompt: context
-// overflow compacts and retries under a small budget; other stream errors
-// are classified fatal (llm.ErrProviderFatal) or transient (budgeted
+// runRecovered is the turn-recovery ladder around one prompt or resume:
+// context overflow compacts and retries under a small budget; other stream
+// errors are classified fatal (llm.ErrProviderFatal) or transient (budgeted
 // backoff via a fresh attempt).
-func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
+func (r *submissionRun) runRecovered(ctx context.Context, agent *pi.Agent, promptFn func(context.Context, *pi.Agent) error) error {
 	compactions := 0
 	for {
-		err := r.runPrompt(ctx, agent, msg)
+		err := promptFn(ctx, agent)
 		if err == nil {
 			return nil
 		}
 		if errors.Is(err, errDeadlineHalted) || ctx.Err() != nil {
+			return err
+		}
+		if errors.Is(err, pi.ErrNothingToResume) {
+			// The wake lands the outcome before requeueing, so a resume
+			// drive always finds a tool-result tail; a miss signals a
+			// wake-ordering bug. Propagate: the catch-all arm settles the
+			// submission failed (run_failed) — a hard fail is intended,
+			// never a retry.
 			return err
 		}
 		if errors.Is(llm.AsContextOverflow(err), llm.ErrContextOverflow) {
@@ -687,7 +1238,8 @@ func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
 	var order []danglingCall
 	pending := make(map[string]bool)
 
-	for _, rec := range Reduce(recs).ActiveLeafPath() {
+	path := Reduce(recs).ActiveLeafPath()
+	for _, rec := range path {
 		switch rec.Kind {
 		case KindAssistantToolCall:
 			var p AssistantToolCallPayload
@@ -702,6 +1254,38 @@ func (r *submissionRun) reconcileDanglingToolCalls(ctx context.Context) error {
 				return fmt.Errorf("decode tool_outcome for reconciliation: %w", err)
 			}
 			delete(pending, p.CallID)
+		}
+	}
+
+	// Suspension exemption (HARNESS-15): a spawned task call is
+	// intentionally outcome-less while its child runs — the wake authors
+	// the outcome at settlement. Subtract those calls so a re-driven
+	// parent never sees a fabricated error for a live child (which the
+	// wake's existing-outcome-wins check would then honor forever). A
+	// missing child row means the admission never landed — treat it as
+	// settled and let the call reconcile. The lookup walks the same
+	// active-path slice pending was built from (CallIDs are assumed unique
+	// per path).
+	for _, rec := range path {
+		if rec.Kind != KindTaskSpawned {
+			continue
+		}
+		var sp TaskSpawnedPayload
+		if err := rec.DecodePayload(&sp); err != nil {
+			return fmt.Errorf("decode task_spawned for reconciliation: %w", err)
+		}
+		if !pending[sp.CallID] {
+			continue
+		}
+		child, err := r.rt.store.GetSubmission(ctx, sp.ChildSubmissionID)
+		if err != nil {
+			if errors.Is(err, ErrSubmissionNotFound) {
+				continue
+			}
+			return fmt.Errorf("look up spawned child %s for reconciliation: %w", sp.ChildSubmissionID, err)
+		}
+		if child.Status != StatusSettled {
+			delete(pending, sp.CallID)
 		}
 	}
 	if len(pending) == 0 {
@@ -758,6 +1342,33 @@ func (r *submissionRun) runPrompt(ctx context.Context, agent *pi.Agent, msg pi.M
 	return err
 }
 
+// runResume runs one resume operation on the agent — the re-drive of a
+// woken suspension (HARNESS-15) — wrapped in the OpOperation interceptor
+// boundary and bounded by operation events exactly like runPrompt.
+func (r *submissionRun) runResume(ctx context.Context, agent *pi.Agent) error {
+	corr := r.correlation()
+	r.rt.observe(OperationStartedEvent{Correlation: corr, Operation: "resume"})
+	err := r.rt.intercept(ctx, OpInfo{Kind: OpOperation, Operation: "resume", Correlation: corr}, func(c context.Context) error {
+		return r.resumeOnce(c, agent)
+	})
+	r.rt.observe(OperationEndedEvent{Correlation: r.correlation(), Operation: "resume", Err: errString(err)})
+	return err
+}
+
+// resumeOnce is the unwrapped resume body: agent.Resume continues from the
+// transcript without appending input, so a wake re-drive lands no second
+// user_message. ErrNothingToResume propagates (runRecovered fails the
+// attempt on it).
+func (r *submissionRun) resumeOnce(ctx context.Context, agent *pi.Agent) error {
+	stream, err := agent.Resume(ctx, pi.PromptOpts{
+		SessionID: pi.SessionID(r.conv.ID),
+	})
+	if err != nil {
+		return fmt.Errorf("start resume: %w", err)
+	}
+	return r.consumeStream(ctx, agent, "resume", stream)
+}
+
 // promptOnce is the unwrapped prompt body.
 func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.Message) error {
 	stream, err := agent.Prompt(ctx, msg, pi.PromptOpts{
@@ -766,7 +1377,12 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	if err != nil {
 		return fmt.Errorf("start prompt: %w", err)
 	}
+	return r.consumeStream(ctx, agent, "prompt", stream)
+}
 
+// consumeStream drains one prompt or resume stream into canonical records
+// and maps the terminal result: halt, interruption, suspension.
+func (r *submissionRun) consumeStream(ctx context.Context, agent *pi.Agent, op string, stream *pi.EventStream) error {
 	for ev := range stream.Events {
 		if err := r.consumeEvent(ctx, ev); err != nil {
 			// Record authoring must not lose events silently; stop the run.
@@ -779,7 +1395,7 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	}
 	result := <-stream.Done
 	if result.Err != nil {
-		return fmt.Errorf("prompt: %w", result.Err)
+		return fmt.Errorf("%s: %w", op, result.Err)
 	}
 	r.mu.Lock()
 	halted := r.halted
@@ -789,6 +1405,14 @@ func (r *submissionRun) promptOnce(ctx context.Context, agent *pi.Agent, msg pi.
 	}
 	if ctx.Err() != nil {
 		return fmt.Errorf("run interrupted: %w", context.Cause(ctx))
+	}
+	if result.Suspended {
+		// Propagate the suspension regardless of pendingSpawns: the spawn
+		// payload rides agent-core's lossy event channel, so a dropped
+		// ToolCallEndEvent leaves pendingSpawns at zero with a live child.
+		// drive's park-time reconciliation makes the park/settle decision
+		// from durable child state.
+		r.suspended = true
 	}
 	return nil
 }
@@ -903,6 +1527,48 @@ func (r *submissionRun) consumeEvent(ctx context.Context, ev pi.AgentEvent) erro
 		r.rt.observe(ToolCallEndedEvent{Correlation: r.correlation(), CallID: e.CallID, ToolName: e.ToolName, IsError: e.Result.IsError})
 		if err := r.flushDeltas(ctx); err != nil {
 			return err
+		}
+		if e.Result.Suspend {
+			// A suspended task call carries its spawn payload in Data
+			// (HARNESS-15). Author the task_spawned record HERE, on the
+			// consumer goroutine, so it lands after the
+			// assistant_tool_call record by construction. No outcome is
+			// authored — the pending call is the suspension point; the
+			// wake authors the outcome on child settlement.
+			var sd spawnData
+			if err := json.Unmarshal(e.Result.Data, &sd); err == nil && sd.SpawnRecordID != "" {
+				exists, err := spawnRecordExists(ctx, r.rt.store, r.conv.ID, sd.CallID)
+				if err != nil {
+					return err
+				}
+				if !exists {
+					rec := r.record(KindTaskSpawned, &TaskSpawnedPayload{
+						CallID:              sd.CallID,
+						Agent:               sd.Agent,
+						ChildInstance:       sd.ChildInstance,
+						ChildConversationID: sd.ChildConversationID,
+						ChildSubmissionID:   sd.ChildSubmissionID,
+						Prompt:              sd.Prompt,
+					})
+					rec.ID = sd.SpawnRecordID
+					if err := r.append(ctx, rec); err != nil {
+						// A failed append here orphans the admitted child: no
+						// task_spawned names it. Two nets catch that — park-time
+						// reconciliation re-authors the record from durable child
+						// state (reconcileSpawnRecords), and the orphan cascade
+						// (Task 11) cancels the child if the parent settles with
+						// it still live.
+						return err
+					}
+				}
+				r.pendingSpawns++
+				return nil
+			}
+			// A Suspend result without spawn data is not a task
+			// suspension: author the outcome as if Suspend were unset so
+			// the submission settles normally instead of parking forever.
+			r.rt.logger.Warn("suspend result without spawn data; authoring outcome normally",
+				"submission", r.sub.ID, "callId", e.CallID, "tool", e.ToolName)
 		}
 		rec := r.record(KindToolOutcome, &ToolOutcomePayload{
 			CallID:   e.CallID,
@@ -1045,13 +1711,13 @@ func (p *interceptedProvider) Stream(ctx context.Context, req llm.LLMRequest) ll
 }
 
 // interceptedTools wraps each registered tool so the OpTool interceptor
-// boundary covers every execution.
-func (r *submissionRun) interceptedTools() []pi.RegisteredTool {
-	if len(r.rt.interceptors) == 0 || len(r.cfg.Tools) == 0 {
-		return r.cfg.Tools
+// boundary covers every execution — including the injected task tool.
+func (r *submissionRun) interceptedTools(tools []pi.RegisteredTool) []pi.RegisteredTool {
+	if len(r.rt.interceptors) == 0 || len(tools) == 0 {
+		return tools
 	}
-	out := make([]pi.RegisteredTool, len(r.cfg.Tools))
-	for i, t := range r.cfg.Tools {
+	out := make([]pi.RegisteredTool, len(tools))
+	for i, t := range tools {
 		out[i] = &interceptedTool{inner: t, run: r}
 	}
 	return out

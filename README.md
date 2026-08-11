@@ -17,6 +17,7 @@ What the harness adds on top of agent-core:
 - **HTTP transport** — `POST` = 202 admission, `GET` = SSE replay-from-offset then live tail, `?wait=true` blocking convenience, `POST …/steer` and `…/followup` for mid-run control — see ADR-0004.
 - **`user` vs `signal` inbound kinds** — direct exchanges vs. one participant's activity in a multi-party conversation (a Slack thread, a GitHub issue), in the record schema from day one — see ADR-0005.
 - **Structured results** — attach a JSON Schema to a prompt (`resultSchema`) and get validated JSON on the settled record, with corrective-turn retries.
+- **Durable subagents** — a running agent can spawn another registered definition via the injected `task` tool; the parent suspends durably (no parked goroutine, no lease held) and resumes with the child's final answer as the tool result — see "Durable subagents" below.
 - **Pluggable storage** — one narrow adapter contract (Submission + Conversation + Attachment stores), memory and SQLite in-tree, shipped conformance test suite — see ADR-0006 and "Writing a store adapter" below.
 - **Observability seams** — a typed event `Observer` plus an execution `Interceptor` at every operation boundary (attempt, operation, model turn, tool); the future OTel adapter needs no engine changes — see ADR-0008.
 
@@ -72,6 +73,27 @@ http.ListenAndServe(":8484", rt.Handler()) // auth = your middleware
 
 `rt.Dispatch` / `rt.Wait` / `rt.Steer` / `rt.FollowUp` / `rt.Compact` expose the same operations in-process.
 
+## Durable subagents
+
+A running agent can delegate to another registered definition through the harness-injected `task` tool (HARNESS-15). The call admits a **durable child submission** — leased, retried, and settled by the same engine as any dispatch — and the parent suspends at the transcript level: the pending `assistant_tool_call` is the durable suspension point, no goroutine parked, no lease held. When the child settles, the harness appends the parent's pending tool outcome (the wake) and requeues it; the resumed turn sees the child's final answer as the tool result.
+
+```go
+rt, _ := harness.NewRuntime(harness.Config{
+    Agents: map[string]harness.AgentDefinition{
+        "triage":     {Description: "classify bug reports", Initialize: initTriage},
+        "researcher": {Description: "answer lookups", Initialize: initResearcher},
+    },
+    Store:     store,
+    Subagents: harness.SubagentPolicy{"triage": {"researcher"}}, // absent key → no task tool
+})
+```
+
+`Description` is routing metadata shown to the parent model in the task tool's schema. From the model's side a `task(agent, prompt)` call is an ordinary blocking tool call: the result is the child's final answer (or its validated JSON when the child dispatch carried a `resultSchema`), and a failed child comes back as `isError: true` carrying the child's error, error code, and partial output. Parallel `task` calls in one turn fan out; the parent resumes when its last child settles.
+
+The durability guarantees are the engine's own: a crash while waiting loses nothing — the suspension point and the child row are durable, the child keeps running under its own lease, and the settlement wake (replayed on the recovery path when it was missed) re-drives the parent; the waiting parent holds no lease and is excluded from the interrupted-running reclaim. A parent that settles with live children cascades cancellation to them (`OnParentTerminal`; v1 offers `CancelChildren` only).
+
+`SubagentLimits` bound the fan-out: `MaxChildrenPerRun` (default 8; excess calls get an immediate error result, never a suspension), `MaxDepth` (default 1 — children get no task tool, so cycles are impossible by construction), `MaxWait` (default 0 = unbounded; a lapsed wait lands an error outcome and cancels the children). There is no operator-facing cancel API yet — cancellation is engine-internal (the orphan cascade, wait expiry). See [`examples/triage`](examples/triage) for a runnable wiring.
+
 ## Examples
 
 Every example runs keyless with `go run` (a deterministic local provider stands in for the model) and switches to Gemini when `GEMINI_API_KEY` is set. Each `main.go` opens with a copy-paste runbook.
@@ -102,7 +124,7 @@ The suite pins every engine-visible invariant — admission idempotency and payl
 
 ## What this is not (v1)
 
-Channel adapters (Slack, Discord, …), a client SDK, React bindings, a dev console, a CLI, workflows, sandboxes/`shell`, and sub-agent `task` delegation are all deferred. The seams for each exist in the design; the packages do not. See `docs/architecture.md` §10.
+Channel adapters (Slack, Discord, …), a client SDK, React bindings, a dev console, a CLI, workflows, and sandboxes/`shell` are all deferred. The seams for each exist in the design; the packages do not. See `docs/architecture.md` §10.
 
 ## Layering
 

@@ -19,13 +19,14 @@ func (k SessionKey) String() string {
 }
 
 // SubmissionStatus is the durable lifecycle state of a submission:
-// queued → running → terminalizing → settled.
+// queued → running → waiting → running → terminalizing → settled.
 type SubmissionStatus string
 
 // Submission lifecycle states.
 const (
 	StatusQueued        SubmissionStatus = "queued"
 	StatusRunning       SubmissionStatus = "running"
+	StatusWaiting       SubmissionStatus = "waiting" // suspended on child submissions; no lease held
 	StatusTerminalizing SubmissionStatus = "terminalizing"
 	StatusSettled       SubmissionStatus = "settled"
 )
@@ -48,4 +49,20 @@ type Submission struct {
 	// settlement can name the underlying failure (HARNESS-12).
 	LastError string    `json:"lastError,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
+	// ParentSubmissionID/ParentCallID link a child submission to the task
+	// call that spawned it (HARNESS-15); empty for root dispatches.
+	ParentSubmissionID string `json:"parentSubmissionId,omitempty"`
+	ParentCallID       string `json:"parentCallId,omitempty"`
+	// Depth is the spawn depth (0 for root dispatches; child = parent+1).
+	Depth int `json:"depth,omitempty"`
+	// PendingResume marks a submission parked in waiting whose next drive
+	// must Resume (not Prompt) — set by WaitSubmission, kept by
+	// ResumeSubmission, consumed by the claim that re-drives it (the claimed
+	// row carries the flag; the stored row clears it).
+	PendingResume bool `json:"pendingResume,omitempty"`
+	// WaitUntil bounds the wait when SubagentLimits.MaxWait is set; zero = unbounded.
+	WaitUntil time.Time `json:"waitUntil,omitzero"`
+	// CancelRequested asks the owning coordinator to cancel the attempt at
+	// the next turn boundary (orphan cascade).
+	CancelRequested bool `json:"cancelRequested,omitempty"`
 }

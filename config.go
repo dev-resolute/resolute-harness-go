@@ -85,8 +85,33 @@ func (c AgentRuntimeConfig) validate() error {
 // (ADR-0009). Initialize runs on every claim, so per-instance dynamic setup
 // — tenant prompts, per-user tools — is first-class.
 type AgentDefinition struct {
-	Initialize func(ctx context.Context, id InstanceID, env Env) (AgentRuntimeConfig, error)
+	// Description is routing metadata shown to parent models in the task
+	// tool schema (HARNESS-15).
+	Description string
+	Initialize  func(ctx context.Context, id InstanceID, env Env) (AgentRuntimeConfig, error)
 }
+
+// SubagentPolicy maps an agent definition name to the set of definitions it
+// may spawn via the injected task tool (HARNESS-15). Absent key: no task tool.
+type SubagentPolicy map[string][]string
+
+// SubagentLimits bound durable subagent fan-out. Zero values resolve to
+// documented defaults at NewRuntime.
+type SubagentLimits struct {
+	MaxChildrenPerRun int           // default 8; excess task calls → immediate error result
+	MaxDepth          int           // default 1; the feature is off for agents with no SubagentPolicy entry
+	MaxWait           time.Duration // default 0 = unbounded wait
+	OnParentTerminal  OrphanPolicy  // default CancelChildren
+}
+
+// OrphanPolicy selects what happens to live children when a parent settles
+// terminally (v1 offers only CancelChildren).
+type OrphanPolicy int
+
+const (
+	// CancelChildren cancels a parent's live children when it settles.
+	CancelChildren OrphanPolicy = iota
+)
 
 // Config carries everything NewRuntime needs: the named agent definitions,
 // the store, and optional environment, logging, and engine-timing seams.
@@ -114,6 +139,12 @@ type Config struct {
 	// Interceptors wrap every operation boundary in registration order
 	// (first is outermost).
 	Interceptors []Interceptor
+	// Subagents maps an agent definition name to the definitions it may
+	// spawn (HARNESS-15); an absent key means no task tool.
+	Subagents SubagentPolicy
+	// SubagentLimits bound durable subagent fan-out; zero values resolve to
+	// documented defaults at NewRuntime.
+	SubagentLimits SubagentLimits
 }
 
 func (c Config) validate() error {
@@ -131,5 +162,29 @@ func (c Config) validate() error {
 	if c.Store == nil {
 		return errors.New("runtime config: Store is required")
 	}
+	for parent, targets := range c.Subagents {
+		if _, ok := c.Agents[parent]; !ok {
+			return fmt.Errorf("subagent policy: unknown parent agent %q", parent)
+		}
+		for _, target := range targets {
+			if _, ok := c.Agents[target]; !ok {
+				return fmt.Errorf("subagent policy: %q may spawn unknown agent %q", parent, target)
+			}
+		}
+	}
 	return nil
+}
+
+// resolveLimits returns c.SubagentLimits with defaults filled (HARNESS-15):
+// MaxChildrenPerRun 8, MaxDepth 1, OnParentTerminal CancelChildren. MaxWait
+// stays 0 (unbounded).
+func (c Config) resolveLimits() SubagentLimits {
+	l := c.SubagentLimits
+	if l.MaxChildrenPerRun == 0 {
+		l.MaxChildrenPerRun = 8
+	}
+	if l.MaxDepth == 0 {
+		l.MaxDepth = 1
+	}
+	return l
 }

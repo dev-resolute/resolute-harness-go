@@ -175,8 +175,22 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	sub.AttemptID = claim.AttemptID
 	sub.OwnerID = claim.OwnerID
 	sub.LeaseExpiresAt = claim.LeaseExpiresAt
-	sub.AttemptCount++
+	// A resume claim re-drives a parked parent — it is not a failure
+	// re-attempt, so it must not consume the failure-attempt budget (a
+	// parent may legally suspend/resume more than MaxAttempts times across
+	// a multi-wave fan-out). transientBackoff keys off AttemptCount, so the
+	// count must only ever reflect real failures.
+	if !sub.PendingResume {
+		sub.AttemptCount++
+	}
+	// The claim consumes PendingResume: the returned row carries it so the
+	// drive branches Resume vs Prompt on it; the stored row clears it, so a
+	// crash mid-resume re-drives as a plain prompt rather than resuming
+	// into a transcript whose tail may no longer be a tool result.
+	pendingResume := sub.PendingResume
+	sub.PendingResume = false
 	s.subs[sub.ID] = sub
+	sub.PendingResume = pendingResume
 	return sub, nil
 }
 
@@ -269,6 +283,101 @@ func (s *Store) ReleaseSubmission(ctx context.Context, release harness.Submissio
 	}
 	s.subs[sub.ID] = sub
 	return nil
+}
+
+// WaitSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) WaitSubmission(ctx context.Context, wait harness.SubmissionWait) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[wait.SubmissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusRunning || sub.AttemptID != wait.AttemptID {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusWaiting
+	sub.OwnerID = ""
+	sub.AttemptID = ""
+	sub.LeaseExpiresAt = time.Time{}
+	sub.PendingResume = true
+	sub.WaitUntil = wait.WaitUntil
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+// ResumeSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return harness.ErrSubmissionNotFound
+	}
+	if sub.Status != harness.StatusWaiting {
+		return harness.ErrClaimLost
+	}
+	sub.Status = harness.StatusQueued
+	sub.WaitUntil = time.Time{}
+	s.subs[sub.ID] = sub
+	return nil
+}
+
+// ListChildSubmissions implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]harness.Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		if sub := s.subs[id]; sub.ParentSubmissionID == parentSubmissionID {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+// ListExpiredWaits implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListExpiredWaits(ctx context.Context, now time.Time) ([]harness.Submission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []harness.Submission
+	for _, id := range s.subOrder {
+		sub := s.subs[id]
+		if sub.Status == harness.StatusWaiting && !sub.WaitUntil.IsZero() && !sub.WaitUntil.After(now) {
+			out = append(out, sub)
+		}
+	}
+	return out, nil
+}
+
+// CancelSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[submissionID]
+	if !ok {
+		return false, harness.ErrSubmissionNotFound
+	}
+	switch sub.Status {
+	case harness.StatusQueued, harness.StatusWaiting:
+		sub.Status = harness.StatusSettled
+		sub.LastError = reason
+		sub.PendingResume = false
+		sub.WaitUntil = time.Time{}
+		s.subs[sub.ID] = sub
+		return false, nil
+	case harness.StatusRunning:
+		sub.CancelRequested = true
+		s.subs[sub.ID] = sub
+		return true, nil
+	default: // terminalizing or settled — already terminal
+		return false, harness.ErrClaimLost
+	}
 }
 
 // ReserveSettlement implements the corresponding harness.Store method; semantics

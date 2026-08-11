@@ -3,6 +3,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -48,6 +49,51 @@ func newTestProjection() (*projection, *fakeConvStore) {
 		attemptID:    "attempt-1",
 	}
 	return proj, store
+}
+
+// TestProjectionSkipsTaskSpawned pins the projection-safety rule (HARNESS-15): a task_spawned record — like any non-message record — never leaks into the LLM-facing []pi.Message.
+func TestProjectionSkipsTaskSpawned(t *testing.T) {
+	base := []Record{
+		{RecordEnvelope: RecordEnvelope{ID: "r1", Kind: KindConversationCreated, ConversationID: "conv-1"},
+			Payload: mustPayload(&ConversationCreatedPayload{Agent: "support", Instance: "acme", Session: "default"})},
+		{RecordEnvelope: RecordEnvelope{ID: "r2", Kind: KindUserMessage, ConversationID: "conv-1"},
+			Payload: mustPayload(&UserMessagePayload{Body: "hi there"})},
+		{RecordEnvelope: RecordEnvelope{ID: "r3", Kind: KindAssistantToolCall, ConversationID: "conv-1"},
+			Payload: mustPayload(&AssistantToolCallPayload{CallID: "call-1", ToolName: "task"})},
+		{RecordEnvelope: RecordEnvelope{ID: "r5", Kind: KindToolOutcome, ConversationID: "conv-1"},
+			Payload: mustPayload(&ToolOutcomePayload{CallID: "call-1", ToolName: "task", Content: "child answer"})},
+	}
+	spawned := []Record{
+		base[0], base[1], base[2],
+		{RecordEnvelope: RecordEnvelope{ID: "r4", Kind: KindTaskSpawned, ConversationID: "conv-1", SubmissionID: "sub-parent"},
+			Payload: mustPayload(&TaskSpawnedPayload{
+				CallID:              "call-1",
+				Agent:               "researcher",
+				ChildInstance:       "acme-call-1",
+				ChildConversationID: "conv-child",
+				ChildSubmissionID:   "sub-child",
+				Prompt:              "summarize the thread",
+			})},
+		base[3],
+	}
+
+	load := func(recs []Record) []pi.Message {
+		t.Helper()
+		proj, store := newTestProjection()
+		store.recs = recs
+		msgs, err := proj.Load(context.Background(), pi.SessionID(proj.conv.ID))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return msgs
+	}
+	want, got := load(base), load(spawned)
+	if len(got) != 3 {
+		t.Fatalf("Load with task_spawned returned %d messages, want 3: %+v", len(got), got)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Load with task_spawned = %+v, want identical to load without it %+v", got, want)
+	}
 }
 
 // TestAppendBranchSummaryUsageRoundTrip covers AGENT-20's harness half: the

@@ -23,7 +23,7 @@ import (
 // schemaVersion is stamped into PRAGMA user_version on initialization and
 // checked on every open. Opening a database from a newer build fails with
 // harness.ErrUnsupportedSchema instead of corrupting it.
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schema = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -57,10 +57,17 @@ CREATE TABLE IF NOT EXISTS submissions (
 	owner_id         TEXT NOT NULL DEFAULT '',
 	lease_expires_ns INTEGER NOT NULL DEFAULT 0,
 	last_error       TEXT NOT NULL DEFAULT '',
+	parent_submission_id TEXT NOT NULL DEFAULT '',
+	parent_call_id   TEXT NOT NULL DEFAULT '',
+	depth            INTEGER NOT NULL DEFAULT 0,
+	pending_resume   INTEGER NOT NULL DEFAULT 0,
+	wait_until_ns    INTEGER NOT NULL DEFAULT 0,
+	cancel_requested INTEGER NOT NULL DEFAULT 0,
 	created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_by_session ON submissions(session_key, seq);
 CREATE INDEX IF NOT EXISTS submissions_by_status ON submissions(status);
+CREATE INDEX IF NOT EXISTS submissions_by_parent ON submissions(parent_submission_id);
 CREATE TABLE IF NOT EXISTS attempts (
 	seq           INTEGER PRIMARY KEY AUTOINCREMENT,
 	id            TEXT NOT NULL,
@@ -118,15 +125,10 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("stamp schema version in %s: %w", path, err)
 		}
-	case 1:
-		// v1 -> v2: submissions gained last_error (HARNESS-12).
-		if _, err := db.Exec("ALTER TABLE submissions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+	case 1, 2:
+		if err := migrateToV3(db, path, version); err != nil {
 			db.Close()
-			return nil, fmt.Errorf("migrate schema v1->v2 in %s: %w", path, err)
-		}
-		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("stamp schema version in %s: %w", path, err)
+			return nil, err
 		}
 	case schemaVersion:
 		// Supported.
@@ -136,6 +138,49 @@ func Open(path string) (*Store, error) {
 			path, version, schemaVersion, harness.ErrUnsupportedSchema)
 	}
 	return &Store{db: db}, nil
+}
+
+// migrateToV3 upgrades a v1 or v2 database to the current schema inside a
+// single transaction: a crash mid-migration rolls back to the pre-migration
+// version instead of wedging the DB between versions (some ALTERs applied,
+// user_version unstamped). v1 falls through to the v2 step after gaining
+// last_error.
+func migrateToV3(db *sql.DB, path string, from int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema migration in %s: %w", path, err)
+	}
+	defer tx.Rollback()
+	if from == 1 {
+		// v1 -> v2: submissions gained last_error (HARNESS-12).
+		if _, err := tx.Exec("ALTER TABLE submissions ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate schema v1->v2 in %s: %w", path, err)
+		}
+	}
+	// v2 -> v3: submissions gained the parent-link and waiting-state
+	// columns (HARNESS-15).
+	for _, stmt := range []string{
+		"ALTER TABLE submissions ADD COLUMN parent_submission_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE submissions ADD COLUMN parent_call_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE submissions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN pending_resume INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN wait_until_ns INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE submissions ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+		"CREATE INDEX IF NOT EXISTS submissions_by_parent ON submissions(parent_submission_id)",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate schema v2->v3 in %s: %w", path, err)
+		}
+	}
+	// user_version participates in the transaction (unlike journal_mode),
+	// so the stamp commits or rolls back with the ALTERs.
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return fmt.Errorf("stamp schema version in %s: %w", path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema migration in %s: %w", path, err)
+	}
+	return nil
 }
 
 // Close releases the underlying database.
@@ -249,11 +294,14 @@ func (s *Store) AdmitSubmission(ctx context.Context, sub harness.Submission) (ha
 	}
 	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO submissions (id, session_key, agent, instance, session, conversation_id,
-			status, input_json, attempt_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+			status, input_json, attempt_count, created_at,
+			parent_submission_id, parent_call_id, depth, pending_resume, wait_until_ns, cancel_requested)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
 		sub.ID, sub.SessionKey.String(), sub.SessionKey.Agent, string(sub.SessionKey.Instance),
 		sub.SessionKey.Session, sub.ConversationID, string(sub.Status), inputJSON,
-		sub.AttemptCount, sub.CreatedAt.UTC().Format(time.RFC3339Nano))
+		sub.AttemptCount, sub.CreatedAt.UTC().Format(time.RFC3339Nano),
+		sub.ParentSubmissionID, sub.ParentCallID, sub.Depth, sub.PendingResume,
+		unixNanoOrZero(sub.WaitUntil), sub.CancelRequested)
 	if err != nil {
 		return harness.Submission{}, fmt.Errorf("admit submission %s: %w", sub.ID, err)
 	}
@@ -278,16 +326,19 @@ func (s *Store) AdmitSubmission(ctx context.Context, sub harness.Submission) (ha
 }
 
 const submissionColumns = `id, agent, instance, session, conversation_id, status,
-	input_json, attempt_count, attempt_id, owner_id, lease_expires_ns, last_error, created_at`
+	input_json, attempt_count, attempt_id, owner_id, lease_expires_ns, last_error, created_at,
+	parent_submission_id, parent_call_id, depth, pending_resume, wait_until_ns, cancel_requested`
 
 func scanSubmission(row interface{ Scan(...any) error }) (harness.Submission, error) {
 	var sub harness.Submission
 	var inputJSON []byte
-	var leaseNS int64
+	var leaseNS, waitUntilNS int64
 	var createdAt string
 	err := row.Scan(&sub.ID, &sub.SessionKey.Agent, &sub.SessionKey.Instance, &sub.SessionKey.Session,
 		&sub.ConversationID, &sub.Status, &inputJSON, &sub.AttemptCount, &sub.AttemptID,
-		&sub.OwnerID, &leaseNS, &sub.LastError, &createdAt)
+		&sub.OwnerID, &leaseNS, &sub.LastError, &createdAt,
+		&sub.ParentSubmissionID, &sub.ParentCallID, &sub.Depth, &sub.PendingResume,
+		&waitUntilNS, &sub.CancelRequested)
 	if err != nil {
 		return harness.Submission{}, err
 	}
@@ -297,11 +348,23 @@ func scanSubmission(row interface{ Scan(...any) error }) (harness.Submission, er
 	if leaseNS != 0 {
 		sub.LeaseExpiresAt = time.Unix(0, leaseNS)
 	}
+	if waitUntilNS != 0 {
+		sub.WaitUntil = time.Unix(0, waitUntilNS)
+	}
 	sub.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
 		return harness.Submission{}, fmt.Errorf("parse created_at of %s: %w", sub.ID, err)
 	}
 	return sub, nil
+}
+
+// unixNanoOrZero encodes a timestamp as Unix nanoseconds, mapping the zero
+// time to 0; scanSubmission decodes 0 back to the zero time.
+func unixNanoOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
 }
 
 // GetSubmission implements the corresponding harness.Store method; semantics
@@ -366,9 +429,20 @@ func (s *Store) ListByStatus(ctx context.Context, status harness.SubmissionStatu
 // ClaimSubmission implements the corresponding harness.Store method; semantics
 // are specified on the contract and pinned by the conformance suite.
 func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionClaim) (harness.Submission, error) {
+	// Capture PendingResume before the claim consumes it: the returned row
+	// carries it so the drive branches Resume vs Prompt on it; the stored
+	// row clears it (see the memory store for the rationale).
+	var pendingResume bool
+	if err := s.db.QueryRowContext(ctx, `SELECT pending_resume FROM submissions WHERE id = ?`, claim.SubmissionID).Scan(&pendingResume); err != nil {
+		return harness.Submission{}, fmt.Errorf("read pending resume for claim %s: %w", claim.SubmissionID, err)
+	}
+	// A resume claim (pending_resume set) does not increment attempt_count:
+	// it re-drives a parked parent, not a failed attempt (see the memory
+	// store). SET expressions evaluate against the pre-update row.
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE submissions SET status = 'running', attempt_id = ?, owner_id = ?,
-			lease_expires_ns = ?, attempt_count = attempt_count + 1
+			lease_expires_ns = ?, attempt_count = attempt_count + CASE WHEN pending_resume = 0 THEN 1 ELSE 0 END,
+			pending_resume = 0
 		WHERE id = ? AND status = 'queued'`,
 		claim.AttemptID, claim.OwnerID, claim.LeaseExpiresAt.UnixNano(), claim.SubmissionID)
 	if err != nil {
@@ -377,7 +451,12 @@ func (s *Store) ClaimSubmission(ctx context.Context, claim harness.SubmissionCla
 	if err := casApplied(res, s.submissionExists(ctx, claim.SubmissionID)); err != nil {
 		return harness.Submission{}, err
 	}
-	return s.GetSubmission(ctx, claim.SubmissionID)
+	sub, err := s.GetSubmission(ctx, claim.SubmissionID)
+	if err != nil {
+		return harness.Submission{}, err
+	}
+	sub.PendingResume = pendingResume
+	return sub, nil
 }
 
 // casApplied maps a zero-row UPDATE to the right sentinel: the submission is
@@ -487,6 +566,119 @@ func (s *Store) ReleaseSubmission(ctx context.Context, release harness.Submissio
 		return fmt.Errorf("release %s: %w", release.SubmissionID, err)
 	}
 	return casApplied(res, s.submissionExists(ctx, release.SubmissionID))
+}
+
+// WaitSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) WaitSubmission(ctx context.Context, wait harness.SubmissionWait) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE submissions SET status = 'waiting', attempt_id = '', owner_id = '',
+			lease_expires_ns = 0, pending_resume = 1, wait_until_ns = ?
+		WHERE id = ? AND status = 'running' AND attempt_id = ?`,
+		unixNanoOrZero(wait.WaitUntil), wait.SubmissionID, wait.AttemptID)
+	if err != nil {
+		return fmt.Errorf("wait %s: %w", wait.SubmissionID, err)
+	}
+	return casApplied(res, s.submissionExists(ctx, wait.SubmissionID))
+}
+
+// ResumeSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ResumeSubmission(ctx context.Context, submissionID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE submissions SET status = 'queued', wait_until_ns = 0
+		WHERE id = ? AND status = 'waiting'`,
+		submissionID)
+	if err != nil {
+		return fmt.Errorf("resume %s: %w", submissionID, err)
+	}
+	return casApplied(res, s.submissionExists(ctx, submissionID))
+}
+
+// ListChildSubmissions implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListChildSubmissions(ctx context.Context, parentSubmissionID string) ([]harness.Submission, error) {
+	subs, err := s.querySubmissions(ctx, `
+		SELECT `+submissionColumns+` FROM submissions WHERE parent_submission_id = ? ORDER BY seq`,
+		parentSubmissionID)
+	if err != nil {
+		return nil, fmt.Errorf("list children of %s: %w", parentSubmissionID, err)
+	}
+	return subs, nil
+}
+
+// ListExpiredWaits implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) ListExpiredWaits(ctx context.Context, now time.Time) ([]harness.Submission, error) {
+	subs, err := s.querySubmissions(ctx, `
+		SELECT `+submissionColumns+` FROM submissions
+		WHERE status = 'waiting' AND wait_until_ns != 0 AND wait_until_ns <= ? ORDER BY seq`,
+		now.UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("list expired waits: %w", err)
+	}
+	return subs, nil
+}
+
+// CancelSubmission implements the corresponding harness.Store method; semantics
+// are specified on the contract and pinned by the conformance suite.
+func (s *Store) CancelSubmission(ctx context.Context, submissionID, reason string) (wasRunning bool, err error) {
+	// The settle-or-flag decision must be linearizable: a concurrent
+	// WaitSubmission landing between a status read and the UPDATEs must not
+	// make a live submission look terminal. One BEGIN IMMEDIATE transaction
+	// holds the write lock across the read-decide-write (safe: the pool is a
+	// single connection).
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("cancel %s conn: %w", submissionID, err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return false, fmt.Errorf("cancel %s begin: %w", submissionID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, rbErr := conn.ExecContext(context.Background(), "ROLLBACK"); rbErr != nil && err == nil {
+				err = fmt.Errorf("cancel %s rollback: %w", submissionID, rbErr)
+			}
+		}
+	}()
+
+	var status harness.SubmissionStatus
+	err = conn.QueryRowContext(ctx, `SELECT status FROM submissions WHERE id = ?`, submissionID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, harness.ErrSubmissionNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("cancel %s read: %w", submissionID, err)
+	}
+	switch status {
+	case harness.StatusQueued, harness.StatusWaiting:
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE submissions SET status = 'settled', last_error = ?,
+				pending_resume = 0, wait_until_ns = 0
+			WHERE id = ?`,
+			reason, submissionID); err != nil {
+			return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+		}
+	case harness.StatusRunning:
+		// A running submission is only flagged; the owning coordinator
+		// cancels the run context and settles it.
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE submissions SET cancel_requested = 1 WHERE id = ?`,
+			submissionID); err != nil {
+			return false, fmt.Errorf("cancel %s: %w", submissionID, err)
+		}
+		wasRunning = true
+	default: // terminalizing or settled — already terminal
+		return false, harness.ErrClaimLost
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, fmt.Errorf("cancel %s commit: %w", submissionID, err)
+	}
+	committed = true
+	return wasRunning, nil
 }
 
 // ReserveSettlement implements the corresponding harness.Store method; semantics

@@ -4,6 +4,7 @@ import (
 	"bufio"
 
 	"encoding/json"
+	"fmt"
 
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +12,11 @@ import (
 	"testing"
 	"time"
 
+	llm "github.com/dev-resolute/resolute-llm-go"
 	"github.com/dev-resolute/resolute-llm-go/mock"
 
 	harness "github.com/dev-resolute/resolute-harness-go"
+	"github.com/dev-resolute/resolute-harness-go/memory"
 )
 
 // postDispatch POSTs a dispatch body and decodes the JSON response into out
@@ -170,6 +173,115 @@ func TestHTTPStreamReplaysFromLastEventID(t *testing.T) {
 	}
 	if partial[0].ID != full[2].ID {
 		t.Fatalf("replay from offset starts at %s, want %s", partial[0].ID, full[2].ID)
+	}
+}
+
+// TestHTTPStreamStaysOpenWhileParentWaits streams a session whose parent
+// parks on a task call (HARNESS-15): the stream must stay open through the
+// waiting window — not return once the parked parent's records flush — and
+// then deliver the wake outcome and the resume deltas when they land.
+func TestHTTPStreamStaysOpenWhileParentWaits(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	childGate := make(chan struct{})
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		taskCallTurn("call-1", "reviewer", "review the patch"),
+		textTurn("parent done"),
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("child answer"),
+	}, gates: []<-chan struct{}{childGate}}
+	rt := startRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
+	server := httptest.NewServer(rt.Handler())
+	t.Cleanup(server.Close)
+
+	var res harness.DispatchResult
+	postDispatch(t, server, "/agents/triage/acme", `{"kind":"user","body":"triage this"}`, http.StatusAccepted, &res)
+
+	// Stream in a goroutine: parsed frames go to events, done closes at EOF.
+	events := make(chan sseEvent, 64)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.Get(server.URL + "/agents/triage/acme")
+		if err != nil {
+			done <- err
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			done <- fmt.Errorf("GET stream status = %d, want 200", resp.StatusCode)
+			return
+		}
+		var cur sseEvent
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case line == "":
+				if cur.ID != "" || cur.Data != "" {
+					events <- cur
+				}
+				cur = sseEvent{}
+			case strings.HasPrefix(line, "id: "):
+				cur.ID = strings.TrimPrefix(line, "id: ")
+			case strings.HasPrefix(line, "event: "):
+				cur.Event = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				cur.Data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		done <- scanner.Err()
+	}()
+
+	// The parent parks on the task call; the child stays gated, so nothing
+	// further can settle. The stream must still be open — replayed and
+	// tailed records keep arriving, but no EOF.
+	waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+	var got []sseEvent
+	deadline := time.After(10 * time.Second)
+	for !hasEventKind(got, harness.KindTaskSpawned) {
+		select {
+		case ev := <-events:
+			got = append(got, ev)
+		case err := <-done:
+			t.Fatalf("stream closed while the parent was parked (err %v); events: %+v", err, got)
+		case <-deadline:
+			t.Fatalf("stream never delivered task_spawned; events: %+v", got)
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("stream returned while the parent was waiting (err %v); events: %+v", err, got)
+	case <-time.After(500 * time.Millisecond):
+		// Still open through two fallback-poll cycles: waiting counts as busy.
+	}
+
+	// Release the child: the wake outcome and the resume drive's deltas must
+	// land on the SAME stream, which then closes once the session is idle.
+	close(childGate)
+	for {
+		select {
+		case ev := <-events:
+			got = append(got, ev)
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("stream read error: %v", err)
+			}
+			goto drained
+		case <-time.After(10 * time.Second):
+			t.Fatalf("stream never closed after the parent settled; events: %+v", got)
+		}
+	}
+drained:
+	if !hasEventKind(got, harness.KindToolOutcome) {
+		t.Fatalf("no wake tool_outcome on the stream; events: %+v", got)
+	}
+	if !hasEventKind(got, harness.KindAssistantTextDelta) {
+		t.Fatalf("no resume deltas on the stream; events: %+v", got)
+	}
+	if !hasEventKind(got, harness.KindSubmissionSettled) {
+		t.Fatalf("no submission_settled on the stream; events: %+v", got)
 	}
 }
 
