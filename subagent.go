@@ -163,6 +163,55 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 	safeCallID := sanitizeCallID(callID)
 	dispatchID := t.run.sub.ID + ":" + safeCallID
 
+	// The locked critical section is confined to admit: everything below
+	// — payload marshaling and the observer emission — runs AFTER t.mu is
+	// released. Observer callbacks are synchronous user code; holding the
+	// task-tool mutex across one would serialize all same-turn task calls
+	// against a slow observer and risk deadlock with a re-entrant one.
+	adm, early, err := t.admit(ctx, callID, safeCallID, dispatchID, p)
+	if err != nil {
+		return pi.ToolResult{}, err
+	}
+	if early != nil {
+		return *early, nil
+	}
+
+	data, err := json.Marshal(spawnData{
+		CallID:              callID,
+		Agent:               p.Agent,
+		ChildInstance:       adm.childInstance,
+		ChildConversationID: adm.child.ConversationID,
+		ChildSubmissionID:   adm.child.SubmissionID,
+		Prompt:              p.Prompt,
+		SpawnRecordID:       adm.spawnRecordID,
+	})
+	if err != nil {
+		return pi.ToolResult{}, fmt.Errorf("marshal spawn data for task call %s: %w", callID, err)
+	}
+	t.rt.observe(SubmissionSpawnedEvent{
+		Correlation:         t.run.correlation(),
+		ChildSubmissionID:   adm.child.SubmissionID,
+		ChildConversationID: adm.child.ConversationID,
+		Agent:               p.Agent,
+		CallID:              callID,
+	})
+	return pi.ToolResult{Suspend: true, Data: data}, nil
+}
+
+// admission carries the durable effects of a task call's locked critical
+// section: the admitted (or replayed) child, its derived instance, and the
+// spawn record ID the consumer's task_spawned record must name.
+type admission struct {
+	child         DispatchResult
+	childInstance string
+	spawnRecordID string
+}
+
+// admit runs the task call's serialized critical section under t.mu: the
+// replay check and the fan-out bound must see each prior same-turn call's
+// durable effects. A non-nil early result is a bounded rejection (fan-out
+// overflow) the caller returns as-is.
+func (t *taskTool) admit(ctx context.Context, callID, safeCallID, dispatchID string, p taskParams) (*admission, *pi.ToolResult, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -172,7 +221,7 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 	replay := true
 	if _, err := t.rt.store.GetSubmission(ctx, dispatchID); err != nil {
 		if !errors.Is(err, ErrSubmissionNotFound) {
-			return pi.ToolResult{}, fmt.Errorf("check dispatch replay for task call %s: %w", callID, err)
+			return nil, nil, fmt.Errorf("check dispatch replay for task call %s: %w", callID, err)
 		}
 		replay = false
 	}
@@ -180,7 +229,7 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 	if !replay {
 		children, err := t.rt.store.ListChildSubmissions(ctx, t.run.sub.ID)
 		if err != nil {
-			return pi.ToolResult{}, fmt.Errorf("list child submissions: %w", err)
+			return nil, nil, fmt.Errorf("list child submissions: %w", err)
 		}
 		live := 0
 		for _, ch := range children {
@@ -189,7 +238,7 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 			}
 		}
 		if live >= t.limits.MaxChildrenPerRun {
-			return pi.ToolResult{
+			return nil, &pi.ToolResult{
 				IsError: true,
 				Content: fmt.Sprintf("task: child limit reached (%d live, max %d); wait for a running child to settle or serialize the work", live, t.limits.MaxChildrenPerRun),
 			}, nil
@@ -216,7 +265,7 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 		},
 	})
 	if err != nil {
-		return pi.ToolResult{}, fmt.Errorf("admit child for task call %s: %w", callID, err)
+		return nil, nil, fmt.Errorf("admit child for task call %s: %w", callID, err)
 	}
 
 	if replay {
@@ -225,33 +274,14 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 		// consumer authors keeps the link valid.
 		id, err := childSpawnRecordID(ctx, t.rt.store, res.ConversationID)
 		if err != nil {
-			return pi.ToolResult{}, err
+			return nil, nil, err
 		}
 		if id != "" {
 			spawnRecordID = id
 		}
 	}
 
-	data, err := json.Marshal(spawnData{
-		CallID:              callID,
-		Agent:               p.Agent,
-		ChildInstance:       childInstance,
-		ChildConversationID: res.ConversationID,
-		ChildSubmissionID:   res.SubmissionID,
-		Prompt:              p.Prompt,
-		SpawnRecordID:       spawnRecordID,
-	})
-	if err != nil {
-		return pi.ToolResult{}, fmt.Errorf("marshal spawn data for task call %s: %w", callID, err)
-	}
-	t.rt.observe(SubmissionSpawnedEvent{
-		Correlation:         t.run.correlation(),
-		ChildSubmissionID:   res.SubmissionID,
-		ChildConversationID: res.ConversationID,
-		Agent:               p.Agent,
-		CallID:              callID,
-	})
-	return pi.ToolResult{Suspend: true, Data: data}, nil
+	return &admission{child: res, childInstance: childInstance, spawnRecordID: spawnRecordID}, nil, nil
 }
 
 // childSpawnRecordID recovers the spawn record ID the child conversation

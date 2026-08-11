@@ -45,6 +45,8 @@ type SubmissionSettledEvent struct {
 }
 
 // SubmissionSpawnedEvent reports a durable child admission (HARNESS-15).
+// May fire once per attempt for the same call (replay); dedupe on
+// ChildSubmissionID.
 type SubmissionSpawnedEvent struct {
 	Correlation         // the PARENT's correlation
 	ChildSubmissionID   string

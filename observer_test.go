@@ -525,6 +525,100 @@ func TestObserverSeesSpawnWaitResumeCycle(t *testing.T) {
 	}
 }
 
+// A re-driven attempt that replays the same task call re-emits
+// SubmissionSpawnedEvent: SAME ChildSubmissionID and CallID (the replay
+// admits no second child) under the NEW attempt's correlation. Observers
+// must dedupe on ChildSubmissionID (HARNESS-15).
+func TestObserverSpawnEventReEmittedOnReplayedAttempt(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	obs := &recordingObserver{}
+	childGate := make(chan struct{})
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		taskCallTurn("call-1", "reviewer", "check it"),
+		// The wake requeues the parent; its re-driven attempt replays the
+		// same task call (a provider re-issuing the delegation despite the
+		// wake's outcome), hitting the admission replay short-circuit.
+		taskCallTurn("call-1", "reviewer", "check it"),
+		textTurn("triage done"),
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}, gates: []<-chan struct{}{childGate}}
+	cfg := subagentConfig(store, parent, child, harness.SubagentLimits{})
+	cfg.Observers = []harness.Observer{obs.observe}
+	rt := startRuntime(t, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+
+	// The parent parks on the admitted child.
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+	children, err := store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d, want 1", len(children))
+	}
+	childSub := children[0]
+
+	// Release the child: it settles, the wake lands the outcome and
+	// requeues the parent. The re-driven attempt replays the call and
+	// suspends again; the backstop wake (outcome already landed) requeues
+	// once more, and the third turn settles the parent.
+	close(childGate)
+	if s, err := rt.Wait(ctx, childSub.ID); err != nil || s.Status != harness.SettledSucceeded {
+		t.Fatalf("child settled %+v (%v), want success", s, err)
+	}
+	if s, err := rt.Wait(ctx, parentSub.ID); err != nil || s.Status != harness.SettledSucceeded {
+		t.Fatalf("parent settled %+v (%v), want success after the replayed attempt", s, err)
+	}
+
+	// The replay admitted no second child.
+	children, err = store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d after the replayed attempt, want still 1", len(children))
+	}
+
+	var spawns []harness.SubmissionSpawnedEvent
+	for _, ev := range obs.snapshot() {
+		if e, ok := ev.(harness.SubmissionSpawnedEvent); ok {
+			spawns = append(spawns, e)
+		}
+	}
+	if len(spawns) != 2 {
+		t.Fatalf("spawn events = %d, want 2 (one per attempt)", len(spawns))
+	}
+	first, second := spawns[0], spawns[1]
+
+	// Same child, same call — dedupe key.
+	if first.ChildSubmissionID != childSub.ID || second.ChildSubmissionID != childSub.ID {
+		t.Errorf("ChildSubmissionID = %q then %q, want the same child %q both times",
+			first.ChildSubmissionID, second.ChildSubmissionID, childSub.ID)
+	}
+	if first.CallID != "call-1" || second.CallID != "call-1" {
+		t.Errorf("CallID = %q then %q, want call-1 both times", first.CallID, second.CallID)
+	}
+
+	// But the new attempt's correlation: same submission, fresh AttemptID.
+	if first.AttemptID == "" || second.AttemptID == "" || first.AttemptID == second.AttemptID {
+		t.Errorf("AttemptID = %q then %q, want two distinct non-empty attempt ids", first.AttemptID, second.AttemptID)
+	}
+	if second.SubmissionID != parentSub.ID || second.ConversationID != res.ConversationID {
+		t.Errorf("replay correlation = %+v, want the parent's submission/conversation", second.Correlation)
+	}
+}
+
 // A policy-rejected task call emits NO spawn event (nor waiting/resumed):
 // it is a plain error result, never a durable admission.
 func TestObserverNoSpawnEventForRejectedTaskCall(t *testing.T) {
