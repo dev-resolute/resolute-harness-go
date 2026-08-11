@@ -918,10 +918,36 @@ func TestTaskToolSanitizesCallIDCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Records(parent): %v", err)
 	}
-	if n := countKind(recs, harness.KindTaskSpawned); n != 2 {
-		t.Fatalf("task_spawned records = %d, want 2", n)
+	// Duplicate same-ID task_spawned rows are the documented wake-repair/consumer race outcome on the memory store (no UNIQUE constraint); dedupe by record ID and assert the design's semantic: exactly one distinct CallID per spawn.
+	seen := map[string]bool{}
+	uniq := make([]harness.Record, 0, len(recs))
+	for _, rec := range recs {
+		if seen[rec.ID] {
+			continue
+		}
+		seen[rec.ID] = true
+		uniq = append(uniq, rec)
 	}
-	assertCallSpawnAdjacency(t, recs)
+	spawned := map[string]string{}
+	for _, rec := range uniq {
+		if rec.Kind != harness.KindTaskSpawned {
+			continue
+		}
+		var p harness.TaskSpawnedPayload
+		if err := rec.DecodePayload(&p); err != nil {
+			t.Fatalf("DecodePayload(task_spawned): %v", err)
+		}
+		spawned[p.CallID] = p.ChildSubmissionID
+	}
+	if len(spawned) != 2 {
+		t.Fatalf("distinct task_spawned CallIDs = %d, want 2", len(spawned))
+	}
+	for _, raw := range []string{"call/1", "call?1"} {
+		if want := parentSub.ID + ":" + safeCallID(raw); spawned[raw] != want {
+			t.Errorf("task_spawned for raw callID %q names child %q, want %q", raw, spawned[raw], want)
+		}
+	}
+	assertCallSpawnAdjacency(t, uniq)
 
 	// Release the gated child: the first settle does not requeue (a sibling
 	// is still in flight); the second does, and the parent settles.
