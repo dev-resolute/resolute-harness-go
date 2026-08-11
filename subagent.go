@@ -305,13 +305,19 @@ func spawnRecordExists(ctx context.Context, store Store, conversationID, callID 
 // record ID from the child conversation's ParentRef and the Agent,
 // Instance, and Prompt from the child row — the repair shared by park-time
 // reconciliation (reconcileSpawnRecords) and the settlement wake
-// (wakeParent), so the log order is call→spawn→outcome universally.
+// (wakeParent), so the log order is call→spawn→outcome universally. The
+// envelope is built by hand rather than via r.record, so it drops TurnID
+// and AttemptID — no consumer reads them off a spawn record, so the loss
+// is observability-only.
 //
-// The consumer path can race a wake-side repair (a fast child settle):
-// both paths name the same record ID, so the loser's append is a sqlite
-// UNIQUE error — re-checked and logged here, never fatal — or a same-ID
-// duplicate on memory (v1 single-process serialization keeps the window a
-// crash-settle artifact; docs/adr/0010-v1-scope-full-engine-semantics.md).
+// The consumer path can race a wake-side repair in process (the parent's
+// event-consumer goroutine against the child's settle→wake goroutine — no
+// single-process serialization covers the window): both paths name the
+// same record ID. On sqlite the loser's append is a UNIQUE error —
+// re-checked and logged below, never fatal. On memory AppendRecords never
+// errors, so a true race lands a duplicate same-ID record silently; that
+// is benign because every reader dedupes spawn records by CallID
+// (spawnRecordExists, pendingSpawnedCalls), keeping reducers safe.
 // A missing ParentRef (partial-honor or crash window — the
 // childSpawnRecordID disclosure) leaves the record ID unrecoverable: warn
 // and skip; parking still gates on children-existence, and the wake still

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	llm "github.com/dev-resolute/resolute-llm-go"
+	"github.com/dev-resolute/resolute-llm-go/mock"
 
 	harness "github.com/dev-resolute/resolute-harness-go"
 	"github.com/dev-resolute/resolute-harness-go/memory"
@@ -354,6 +355,173 @@ func TestOrphanCascadeGatedOnPolicy(t *testing.T) {
 	}
 	if childFinal.CancelRequested {
 		t.Error("child row flagged CancelRequested — the cascade touched it despite the policy gate")
+	}
+}
+
+// A parent settling failed with a WAITING child (a suspended run parked
+// on children of its own — or any parked row) settles the child through
+// the same out-of-band arm as a queued one: CancelSubmission settles the
+// waiting row outright and the cascade lands the cancelled record.
+func TestOrphanCascadeSettlesWaitingChild(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	// The parent fails fatally on its first model call (empty script).
+	parent := &scriptProvider{name: "mock"}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}}
+	rt, res := newCascadeRuntime(t, subagentConfig(store, parent, child, harness.SubagentLimits{}))
+	childSub := seedOrphanChild(t, store, res.SubmissionID, "call-1")
+
+	// Park the child in waiting directly through the store — claim it,
+	// then wait it, as a suspended run would leave it — before the
+	// runtime starts, so no claim loop can pick it up in between.
+	ctx := context.Background()
+	const childAttempt = "01A0DEADATTEMPT000000WAIT"
+	if _, err := store.ClaimSubmission(ctx, harness.SubmissionClaim{
+		SubmissionID:   childSub.ID,
+		AttemptID:      childAttempt,
+		OwnerID:        "dead-owner",
+		LeaseExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("ClaimSubmission(child): %v", err)
+	}
+	if err := store.WaitSubmission(ctx, harness.SubmissionWait{
+		SubmissionID: childSub.ID,
+		AttemptID:    childAttempt,
+	}); err != nil {
+		t.Fatalf("WaitSubmission(child): %v", err)
+	}
+	startCascadeRuntime(t, rt)
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	childSettled := waitForSettledRecord(t, rt, childSub.ConversationID, childSub.ID)
+	if childSettled.Status != harness.SettledFailed || childSettled.ErrorCode != harness.SettledErrCancelled {
+		t.Errorf("child settled = %+v, want failed/cancelled_by_parent", childSettled)
+	}
+	if childSettled.Error != "cancelled: parent settled" {
+		t.Errorf("child settled error = %q, want %q", childSettled.Error, "cancelled: parent settled")
+	}
+	if n := len(child.requests()); n != 0 {
+		t.Errorf("child provider calls = %d, want 0 (settled from waiting without an attempt)", n)
+	}
+	childFinal, err := store.GetSubmission(wctx, childSub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission(child): %v", err)
+	}
+	if childFinal.Status != harness.StatusSettled {
+		t.Errorf("child status = %s, want settled", childFinal.Status)
+	}
+	parentSettled, err := rt.Wait(wctx, res.SubmissionID)
+	if err != nil {
+		t.Fatalf("Wait(parent): %v", err)
+	}
+	if parentSettled.Status != harness.SettledFailed || parentSettled.ErrorCode != harness.SettledErrRunFailed {
+		t.Errorf("parent settled = %+v, want failed/run_failed", parentSettled)
+	}
+}
+
+// A submission claimed with CancelRequested set — flagged by the cascade,
+// then released by a shutdown before the run cancel landed — settles
+// cancelled at claim time: runSubmission honors the flag and never drives
+// the attempt, so the provider is never called.
+func TestCancelRequestedClaimSettlesWithoutDriving(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	provider := mock.New("mock") // unscripted: any model call would fail the run
+	conv, sub := seededSubmission(t, store, "hello")
+
+	// Flag the row as the cascade would (CancelSubmission against a
+	// running row), then release it as a shutdown would: queued with
+	// CancelRequested durable.
+	ctx := context.Background()
+	const attempt = "01A0DEADATTEMPT00000FLAG0"
+	if _, err := store.ClaimSubmission(ctx, harness.SubmissionClaim{
+		SubmissionID:   sub.ID,
+		AttemptID:      attempt,
+		OwnerID:        "dead-owner",
+		LeaseExpiresAt: time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("ClaimSubmission: %v", err)
+	}
+	wasRunning, err := store.CancelSubmission(ctx, sub.ID, "parent settled")
+	if err != nil || !wasRunning {
+		t.Fatalf("CancelSubmission = (wasRunning %v, err %v), want (true, nil)", wasRunning, err)
+	}
+	if err := store.ReleaseSubmission(ctx, harness.SubmissionRelease{SubmissionID: sub.ID, AttemptID: attempt}); err != nil {
+		t.Fatalf("ReleaseSubmission: %v", err)
+	}
+
+	rt := startRuntime(t, engineConfig(provider, store, nil))
+	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	settled, err := rt.Wait(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if settled.Status != harness.SettledFailed || settled.ErrorCode != harness.SettledErrCancelled {
+		t.Errorf("settled = %+v, want failed/cancelled_by_parent", settled)
+	}
+	if settled.Error != "cancelled: parent settled" {
+		t.Errorf("settled error = %q, want %q", settled.Error, "cancelled: parent settled")
+	}
+	if n := provider.Called(); n != 0 {
+		t.Errorf("provider calls = %d, want 0 (a flagged row must never be driven)", n)
+	}
+	if n := len(settledRecords(t, rt, conv.ID, sub.ID)); n != 1 {
+		t.Errorf("settled records = %d, want exactly 1", n)
+	}
+	row, err := store.GetSubmission(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if row.Status != harness.StatusSettled {
+		t.Errorf("status = %s, want settled (never released back to queued)", row.Status)
+	}
+}
+
+// A flagged running submission whose owner died (lease expired, run
+// cancel never landed) is settled cancelled by the reclaimer instead of
+// being released for a retry that would defeat the cancel.
+func TestCancelRequestedReclaimSettlesCancelled(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	provider := mock.New("mock") // unscripted: any model call would fail the run
+	conv, sub := seededSubmission(t, store, "hello")
+
+	// Running with a dead owner and an already-expired lease, then flagged
+	// — the cascade lost the owner before its cancel could land.
+	claimed := claimSeeded(t, store, sub)
+	wasRunning, err := store.CancelSubmission(context.Background(), claimed.ID, "parent settled")
+	if err != nil || !wasRunning {
+		t.Fatalf("CancelSubmission = (wasRunning %v, err %v), want (true, nil)", wasRunning, err)
+	}
+
+	rt := startRuntime(t, engineConfig(provider, store, nil))
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settled, err := rt.Wait(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if settled.Status != harness.SettledFailed || settled.ErrorCode != harness.SettledErrCancelled {
+		t.Errorf("settled = %+v, want failed/cancelled_by_parent", settled)
+	}
+	if n := provider.Called(); n != 0 {
+		t.Errorf("provider calls = %d, want 0 (the reclaim must not re-drive the flagged row)", n)
+	}
+	if n := len(settledRecords(t, rt, conv.ID, sub.ID)); n != 1 {
+		t.Errorf("settled records = %d, want exactly 1", n)
+	}
+	row, err := store.GetSubmission(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if row.Status != harness.StatusSettled {
+		t.Errorf("status = %s, want settled", row.Status)
 	}
 }
 

@@ -164,7 +164,10 @@ func (c *coordinator) finalizeInterrupted(ctx context.Context, sub Submission) e
 }
 
 // reclaimExpired releases running submissions whose lease expired — a
-// crashed or wedged owner — so the normal claim path re-attempts them.
+// crashed or wedged owner — so the normal claim path re-attempts them. A
+// flagged (CancelRequested) row is instead settled cancelled: the dead
+// owner's run cancel never landed, and re-queueing the row would defeat
+// the cancel.
 func (c *coordinator) reclaimExpired(ctx context.Context) {
 	expired, err := c.rt.store.ListExpiredLeases(ctx, time.Now())
 	if err != nil {
@@ -189,6 +192,21 @@ func (c *coordinator) reclaimExpired(ctx context.Context) {
 			continue
 		}
 		if err == nil {
+			if sub.CancelRequested {
+				// Flagged for cancel (orphan cascade or wait expiry) but the
+				// owner's run cancel never landed. Release moved the row to
+				// queued; cancel settles it outright. No interleaved claim can
+				// win between the two v1-single-process: reclaim runs on the
+				// claim-loop goroutine.
+				if _, cerr := c.rt.store.CancelSubmission(ctx, sub.ID, "cancelled: parent settled"); cerr != nil {
+					// The row stays queued and flagged; the claim path
+					// (runSubmission) settles it instead.
+					c.rt.logger.Error("cancel reclaimed flagged submission", "submission", sub.ID, "error", cerr)
+					continue
+				}
+				c.settleCancelledChild(ctx, sub)
+				continue
+			}
 			c.rt.logger.Info("reclaimed expired lease", "submission", sub.ID, "deadOwner", sub.OwnerID)
 		}
 	}
@@ -495,6 +513,19 @@ func (c *coordinator) release(sessionKey string) {
 func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	logger := c.rt.logger.With("submission", sub.ID, "session", sub.SessionKey.String(), "attempt", sub.AttemptID)
 
+	// A row claimed with CancelRequested was flagged by the orphan cascade
+	// (or wait expiry) but its run cancel never landed — a shutdown
+	// released the flagged row, or the cascade found no registered run.
+	// Honor the flag: settle cancelled and never drive the attempt.
+	if sub.CancelRequested {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
+		return
+	}
+
 	def := c.rt.agents[sub.SessionKey.Agent]
 	cfg, err := def.Initialize(ctx, sub.SessionKey.Instance, c.rt.env)
 	if err == nil {
@@ -574,7 +605,8 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		// The orphan cascade cancelled the run (the parent settled
 		// terminally): settle cancelled — distinct from the shutdown arm
 		// below, which RELEASES for retry; an orphan has nothing to retry
-		// for.
+		// for. A result that raced the cancel is deliberately discarded:
+		// the parent is terminal, so the orphan's outcome is moot.
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status:    SettledFailed,
 			Error:     "cancelled: parent settled",
@@ -732,24 +764,39 @@ func (c *coordinator) cancelChildren(ctx context.Context, parent Submission) {
 			c.runsMu.Unlock()
 			if ok {
 				cancel(errParentCancelled)
+			} else {
+				// Claim→register window (or another process owns the run):
+				// the flag stands, and the row settles cancelled at claim
+				// (runSubmission) or lease reclaim (reclaimExpired).
+				c.rt.logger.Warn("child flagged but no live run registered; will settle at claim/reclaim", "child", ch.ID)
 			}
 			continue
 		}
 		// Queued/waiting: no attempt will run — CancelSubmission settled
-		// the row already, so land the settled record directly, bypassing
-		// settle's reservation (which expects a running row). The wake
-		// inside appendSettledRecordOnce is a guarded no-op: the parent is
-		// settled by now.
-		if _, err := c.appendSettledRecordOnce(ctx, ch, SettledPayload{
-			Status:    SettledFailed,
-			Error:     "cancelled: parent settled",
-			ErrorCode: SettledErrCancelled,
-		}); err != nil {
-			c.rt.logger.Error("settle cancelled child", "child", ch.ID, "error", err)
-			continue
-		}
-		c.rt.notifySettled()
+		// the row already, so land the settled record directly.
+		c.settleCancelledChild(ctx, ch)
 	}
+}
+
+// settleCancelledChild settles a cascade-cancelled child whose row the
+// store already moved to settled out of band (the queued/waiting arm of
+// cancelChildren, or a flagged row reclaimed after a missed run cancel):
+// it lands the settled record — bypassing settle's reservation, which
+// expects a running row — then observes and notifies like every other
+// settle path. The wake inside appendSettledRecordOnce is a guarded no-op:
+// the parent is settled by now.
+func (c *coordinator) settleCancelledChild(ctx context.Context, ch Submission) {
+	effective, err := c.appendSettledRecordOnce(ctx, ch, SettledPayload{
+		Status:    SettledFailed,
+		Error:     "cancelled: parent settled",
+		ErrorCode: SettledErrCancelled,
+	})
+	if err != nil {
+		c.rt.logger.Error("settle cancelled child", "child", ch.ID, "error", err)
+		return
+	}
+	c.rt.observe(SubmissionSettledEvent{Correlation: ch.correlation(), Payload: effective})
+	c.rt.notifySettled()
 }
 
 // driveAttempt runs the agent for one attempt, returning the validated
