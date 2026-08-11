@@ -517,6 +517,13 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 	// (or wait expiry) but its run cancel never landed — a shutdown
 	// released the flagged row, or the cascade found no registered run.
 	// Honor the flag: settle cancelled and never drive the attempt.
+	//
+	// The reason is approximate: CancelSubmission doesn't persist the
+	// cancel reason for running rows, so a flag from expireWait ("parent
+	// wait expired") also settles here — and at the post-register re-check
+	// and reclaim below — as "cancelled: parent settled" /
+	// cancelled_by_parent. Recording the true provenance needs a store
+	// change (the reason carried on the row); out of scope.
 	if sub.CancelRequested {
 		c.settleAndNotify(ctx, sub, SettledPayload{
 			Status:    SettledFailed,
@@ -582,6 +589,25 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 		delete(c.runs, sub.ID)
 		c.runsMu.Unlock()
 	}()
+
+	// Close the claim→register window: a flag set after the claim-time
+	// snapshot but before this registry insert missed both the check
+	// above and the cascade's registry lookup. Re-read the row now that
+	// the registry covers us; if the flag landed in the gap, settle
+	// cancelled without driving.
+	fresh, err := c.rt.store.GetSubmission(ctx, sub.ID)
+	if err != nil {
+		// The heartbeat's lease renewal and the reclaim remain as
+		// backstops if this read fails.
+		logger.Warn("post-register cancel re-check", "error", err)
+	} else if fresh.CancelRequested {
+		c.settleAndNotify(ctx, sub, SettledPayload{
+			Status:    SettledFailed,
+			Error:     "cancelled: parent settled",
+			ErrorCode: SettledErrCancelled,
+		}, logger)
+		return
+	}
 	heartbeatDone := c.startHeartbeat(runCtx, sub, cancelRun, logger)
 
 	var result json.RawMessage
@@ -766,9 +792,11 @@ func (c *coordinator) cancelChildren(ctx context.Context, parent Submission) {
 				cancel(errParentCancelled)
 			} else {
 				// Claim→register window (or another process owns the run):
-				// the flag stands, and the row settles cancelled at claim
-				// (runSubmission) or lease reclaim (reclaimExpired).
-				c.rt.logger.Warn("child flagged but no live run registered; will settle at claim/reclaim", "child", ch.ID)
+				// the flag stands. Backstops: runSubmission's claim-start
+				// check and post-register re-read settle the row cancelled
+				// if this process claimed it; reclaimExpired settles it if
+				// the owner is dead.
+				c.rt.logger.Warn("child flagged but no live run registered; claim-start check, post-register re-check, or reclaim will settle it", "child", ch.ID)
 			}
 			continue
 		}

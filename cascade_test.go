@@ -2,6 +2,7 @@ package harness_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -517,6 +518,69 @@ func TestCancelRequestedReclaimSettlesCancelled(t *testing.T) {
 		t.Errorf("settled records = %d, want exactly 1", n)
 	}
 	row, err := store.GetSubmission(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("GetSubmission: %v", err)
+	}
+	if row.Status != harness.StatusSettled {
+		t.Errorf("status = %s, want settled", row.Status)
+	}
+}
+
+// flagAfterClaimStore flags a submission CancelRequested immediately
+// after a successful claim of it returns — before the claim loop can
+// register the run — reproducing the claim→register interleaving the
+// cascade's registry lookup misses.
+type flagAfterClaimStore struct {
+	harness.Store
+	target string
+	done   atomic.Bool
+}
+
+func (s *flagAfterClaimStore) ClaimSubmission(ctx context.Context, claim harness.SubmissionClaim) (harness.Submission, error) {
+	sub, err := s.Store.ClaimSubmission(ctx, claim)
+	if err == nil && claim.SubmissionID == s.target && s.done.CompareAndSwap(false, true) {
+		if _, cerr := s.Store.CancelSubmission(ctx, claim.SubmissionID, "parent settled"); cerr != nil {
+			return sub, cerr
+		}
+	}
+	return sub, err
+}
+
+// Regression: a CancelRequested flag landing between the claim and the
+// run's registry insert (the interleaving the cascade's registry lookup
+// misses) must still settle the row cancelled without driving it — the
+// post-register re-read in runSubmission is the backstop.
+func TestCancelRequestedBetweenClaimAndRegisterSettlesCancelled(t *testing.T) {
+	t.Parallel()
+	inner := memory.New()
+	provider := mock.New("mock") // unscripted: any model call would fail the run
+	conv, sub := seededSubmission(t, inner, "hello")
+	store := &flagAfterClaimStore{Store: inner, target: sub.ID}
+
+	rt := startRuntime(t, engineConfig(provider, store, nil))
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	settled, err := rt.Wait(wctx, sub.ID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if !store.done.Load() {
+		t.Fatal("flag hook never fired — the claim path changed")
+	}
+	if settled.Status != harness.SettledFailed || settled.ErrorCode != harness.SettledErrCancelled {
+		t.Errorf("settled = %+v, want failed/cancelled_by_parent", settled)
+	}
+	if settled.Error != "cancelled: parent settled" {
+		t.Errorf("settled error = %q, want %q", settled.Error, "cancelled: parent settled")
+	}
+	if n := provider.Called(); n != 0 {
+		t.Errorf("provider calls = %d, want 0 (a row flagged in the claim→register gap must never be driven)", n)
+	}
+	if n := len(settledRecords(t, rt, conv.ID, sub.ID)); n != 1 {
+		t.Errorf("settled records = %d, want exactly 1", n)
+	}
+	row, err := inner.GetSubmission(wctx, sub.ID)
 	if err != nil {
 		t.Fatalf("GetSubmission: %v", err)
 	}
