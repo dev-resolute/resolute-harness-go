@@ -122,6 +122,7 @@ func (c *coordinator) wakeParent(ctx context.Context, child Submission, payload 
 		}
 		return fmt.Errorf("requeue parent %s: %w", parent.ID, err)
 	}
+	c.rt.observe(SubmissionResumedEvent{Correlation: parent.correlation()})
 	// Nudge the claim loop without blocking (same as Dispatch).
 	select {
 	case c.rt.wake <- struct{}{}:

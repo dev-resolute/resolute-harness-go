@@ -244,7 +244,13 @@ func (t *taskTool) execute(ctx context.Context, callID string, args json.RawMess
 	if err != nil {
 		return pi.ToolResult{}, fmt.Errorf("marshal spawn data for task call %s: %w", callID, err)
 	}
-	// Task 12: emit SubmissionSpawnedEvent
+	t.rt.observe(SubmissionSpawnedEvent{
+		Correlation:         t.run.correlation(),
+		ChildSubmissionID:   res.SubmissionID,
+		ChildConversationID: res.ConversationID,
+		Agent:               p.Agent,
+		CallID:              callID,
+	})
 	return pi.ToolResult{Suspend: true, Data: data}, nil
 }
 

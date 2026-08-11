@@ -701,7 +701,7 @@ func (c *coordinator) runSubmission(ctx context.Context, sub Submission) {
 			logger.Error("wait transition failed; submission stays running and recovers via lease expiry", "error", err)
 			return
 		}
-		// Task 12: emit SubmissionWaitingEvent
+		c.rt.observe(SubmissionWaitingEvent{Correlation: sub.correlation()})
 	default:
 		c.settleAndNotify(ctx, sub, SettledPayload{Status: SettledSucceeded, Result: result}, logger)
 	}

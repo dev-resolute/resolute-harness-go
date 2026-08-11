@@ -44,6 +44,21 @@ type SubmissionSettledEvent struct {
 	Payload SettledPayload
 }
 
+// SubmissionSpawnedEvent reports a durable child admission (HARNESS-15).
+type SubmissionSpawnedEvent struct {
+	Correlation         // the PARENT's correlation
+	ChildSubmissionID   string
+	ChildConversationID string
+	Agent               string
+	CallID              string
+}
+
+// SubmissionWaitingEvent reports a submission suspending into waiting.
+type SubmissionWaitingEvent struct{ Correlation }
+
+// SubmissionResumedEvent reports a waiting submission requeued by a wake.
+type SubmissionResumedEvent struct{ Correlation }
+
 // OperationStartedEvent and OperationEndedEvent bound one session operation
 // ("prompt" or "compact").
 type OperationStartedEvent struct {
@@ -152,6 +167,9 @@ func (SubmissionAdmittedEvent) isHarnessEvent() {}
 func (SubmissionClaimedEvent) isHarnessEvent()  {}
 func (AttemptStartedEvent) isHarnessEvent()     {}
 func (SubmissionSettledEvent) isHarnessEvent()  {}
+func (SubmissionSpawnedEvent) isHarnessEvent()  {}
+func (SubmissionWaitingEvent) isHarnessEvent()  {}
+func (SubmissionResumedEvent) isHarnessEvent()  {}
 func (OperationStartedEvent) isHarnessEvent()   {}
 func (OperationEndedEvent) isHarnessEvent()     {}
 func (TurnStartedEvent) isHarnessEvent()        {}

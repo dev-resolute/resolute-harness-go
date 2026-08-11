@@ -68,6 +68,12 @@ func observedKinds(events []harness.HarnessEvent) []string {
 			out = append(out, "recovery")
 		case harness.SubmissionSettledEvent:
 			out = append(out, "settled")
+		case harness.SubmissionSpawnedEvent:
+			out = append(out, "spawned")
+		case harness.SubmissionWaitingEvent:
+			out = append(out, "waiting")
+		case harness.SubmissionResumedEvent:
+			out = append(out, "resumed")
 		}
 	}
 	return out
@@ -411,4 +417,147 @@ func TestObserverSeesRecoveryEvents(t *testing.T) {
 
 	kinds := observedKinds(obs.snapshot())
 	assertOrderedSubsequence(t, kinds, []string{"recovery", "compaction", "settled"})
+}
+
+// A spawn→wait→wake cycle emits spawned, waiting, and resumed in order,
+// each carrying the PARENT's correlation; the spawn event names the child
+// ids and the call (HARNESS-15).
+func TestObserverSeesSpawnWaitResumeCycle(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	obs := &recordingObserver{}
+	childGate := make(chan struct{})
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		taskCallTurn("call-1", "reviewer", "check it"),
+		textTurn("triage done"),
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}, gates: []<-chan struct{}{childGate}}
+	cfg := subagentConfig(store, parent, child, harness.SubagentLimits{})
+	cfg.Observers = []harness.Observer{obs.observe}
+	rt := startRuntime(t, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+
+	// The parent parks; the gated child cannot wake it early.
+	parentSub := waitForStatus(t, store, res.SubmissionID, harness.StatusWaiting)
+	children, err := store.ListChildSubmissions(ctx, parentSub.ID)
+	if err != nil {
+		t.Fatalf("ListChildSubmissions: %v", err)
+	}
+	if len(children) != 1 {
+		t.Fatalf("children = %d, want 1", len(children))
+	}
+	childSub := children[0]
+
+	close(childGate)
+	if s, err := rt.Wait(ctx, childSub.ID); err != nil || s.Status != harness.SettledSucceeded {
+		t.Fatalf("child settled %+v (%v), want success", s, err)
+	}
+	if s, err := rt.Wait(ctx, parentSub.ID); err != nil || s.Status != harness.SettledSucceeded {
+		t.Fatalf("parent settled %+v (%v), want success after the wake", s, err)
+	}
+
+	events := obs.snapshot()
+	assertOrderedSubsequence(t, observedKinds(events), []string{"spawned", "waiting", "resumed", "settled"})
+
+	var spawn *harness.SubmissionSpawnedEvent
+	var waiting *harness.SubmissionWaitingEvent
+	var resumed *harness.SubmissionResumedEvent
+	for _, ev := range events {
+		switch e := ev.(type) {
+		case harness.SubmissionSpawnedEvent:
+			if spawn == nil {
+				spawn = &e
+			}
+		case harness.SubmissionWaitingEvent:
+			if waiting == nil {
+				waiting = &e
+			}
+		case harness.SubmissionResumedEvent:
+			if resumed == nil {
+				resumed = &e
+			}
+		}
+	}
+	if spawn == nil || waiting == nil || resumed == nil {
+		t.Fatalf("missing events: spawn %v waiting %v resumed %v", spawn, waiting, resumed)
+	}
+
+	// The spawn event carries the parent's correlation plus the child ids.
+	wantCorr := harness.Correlation{
+		SessionKey:     parentSub.SessionKey,
+		ConversationID: res.ConversationID,
+		SubmissionID:   res.SubmissionID,
+	}
+	if spawn.SessionKey != wantCorr.SessionKey || spawn.ConversationID != wantCorr.ConversationID || spawn.SubmissionID != wantCorr.SubmissionID {
+		t.Errorf("spawn correlation = %+v, want parent correlation %+v", spawn.Correlation, wantCorr)
+	}
+	if spawn.ChildSubmissionID != childSub.ID {
+		t.Errorf("spawn ChildSubmissionID = %q, want %q", spawn.ChildSubmissionID, childSub.ID)
+	}
+	if spawn.ChildConversationID != childSub.ConversationID {
+		t.Errorf("spawn ChildConversationID = %q, want %q", spawn.ChildConversationID, childSub.ConversationID)
+	}
+	if spawn.Agent != "reviewer" {
+		t.Errorf("spawn Agent = %q, want reviewer", spawn.Agent)
+	}
+	if spawn.CallID != "call-1" {
+		t.Errorf("spawn CallID = %q, want call-1", spawn.CallID)
+	}
+
+	// Waiting and resumed carry the same parent correlation.
+	for name, corr := range map[string]harness.Correlation{
+		"waiting": waiting.Correlation,
+		"resumed": resumed.Correlation,
+	} {
+		if corr.SessionKey != wantCorr.SessionKey || corr.ConversationID != wantCorr.ConversationID || corr.SubmissionID != wantCorr.SubmissionID {
+			t.Errorf("%s correlation = %+v, want parent correlation %+v", name, corr, wantCorr)
+		}
+	}
+}
+
+// A policy-rejected task call emits NO spawn event (nor waiting/resumed):
+// it is a plain error result, never a durable admission.
+func TestObserverNoSpawnEventForRejectedTaskCall(t *testing.T) {
+	t.Parallel()
+	store := memory.New()
+	obs := &recordingObserver{}
+	parent := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		taskCallTurn("call-1", "scout", "spy on it"),
+		textTurn("cannot delegate"),
+	}}
+	child := &scriptProvider{name: "mock", script: [][]llm.LLMEvent{
+		textTurn("looks good"),
+	}}
+	cfg := subagentConfig(store, parent, child, harness.SubagentLimits{})
+	cfg.Observers = []harness.Observer{obs.observe}
+	rt := startRuntime(t, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := rt.Dispatch(ctx, harness.Dispatch{
+		Agent: "triage", Instance: "acme", Message: harness.UserMessage("triage this"),
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if s, err := rt.Wait(ctx, res.SubmissionID); err != nil || s.Status != harness.SettledSucceeded {
+		t.Fatalf("parent settled %+v (%v), want success (error result, not a suspension)", s, err)
+	}
+
+	for _, ev := range obs.snapshot() {
+		switch ev.(type) {
+		case harness.SubmissionSpawnedEvent, harness.SubmissionWaitingEvent, harness.SubmissionResumedEvent:
+			t.Fatalf("unexpected subagent event for a policy-rejected call: %+v", ev)
+		}
+	}
 }
