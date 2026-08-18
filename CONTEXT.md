@@ -16,7 +16,7 @@ _Avoid:_ thread, chat.
 
 **Task operation** — the third `Operation` kind (HARNESS-15): one durable child run admitted from inside a parent's turn via the injected `task` tool.
 
-**Turn** — one `pi.Agent` LLM round-trip inside an operation. The harness never implements turn mechanics; agent-core owns them.
+**Turn** — one `resolute.Agent` LLM round-trip inside an operation. The harness never implements turn mechanics; agent-core owns them.
 
 **Summarization retry** — agent-core's bounded retry of transient summarization failures during a `Compact` operation (agent-core v0.7.0, upstream 0.81.1). Configured per agent via `AgentRuntimeConfig.SummarizationRetry` (zero value disables); lifecycle surfaces to Observers as `RecoveryEvent` decisions `summarization_retry_scheduled` / `summarization_retry_attempt_start` / `summarization_retry_finished`.
 
@@ -58,9 +58,9 @@ _Avoid:_ event (that's the ephemeral observer stream), message (that's a pi/llm 
 
 **Conversation tree** — the reduced, parent-linked projection. Compaction re-parents; branches and child sessions attach without schema change.
 
-**Active leaf path** — the current branch of the tree, root → leaf; what the projection adapter serves to agent-core as `[]pi.Message`.
+**Active leaf path** — the current branch of the tree, root → leaf; what the projection adapter serves to agent-core as `[]resolute.Message`.
 
-**Projection adapter** — the `pi.SessionRepo` implementation backed by the reduced tree. Read-side view: `Load`/`LoadBranchSummaries` serve projections; `Append` is a no-op (records are authored from the event stream); `AppendBranchSummary` writes a `compaction` record.
+**Projection adapter** — the `resolute.SessionRepo` implementation backed by the reduced tree. Read-side view: `Load`/`LoadBranchSummaries` serve projections; `Append` is a no-op (records are authored from the event stream); `AppendBranchSummary` writes a `compaction` record.
 _Avoid:_ session repo bridge, repo shim.
 
 **User message vs Signal** — the two inbound `DispatchMessage` kinds. `User` = a direct 1:1 exchange with the agent's principal. `Signal` = one participant's activity (sender attributes, type, optional tag) in a multi-party conversation the agent participates in (a Slack thread, a GitHub issue). Never force a signal into `User` — it conflates other participants with the assistant's own user.

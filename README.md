@@ -13,7 +13,7 @@ Design docs: [`docs/architecture.md`](docs/architecture.md) and the ADRs in [`do
 What the harness adds on top of agent-core:
 
 - **Durable submission engine** — idempotent admission, lease-based ownership, attempt tracking, per-session head-of-line serialization, two-phase settlement, crash reconciliation, durability budgets. `kill -9` mid-turn resumes cleanly. No external orchestrator (no Temporal, no DBOS) — see ADR-0002.
-- **Event-sourced conversation** — an append-only log of canonical records, reduced into a parent-linked message *tree*. Recovery, compaction (re-parenting), branching, and future sub-agent sessions all fall out of one structure. The `Agent`'s in-RAM state is rebuilt from this log; a `pi.SessionRepo` adapter projects the active leaf path into agent-core unchanged — see ADR-0003.
+- **Event-sourced conversation** — an append-only log of canonical records, reduced into a parent-linked message *tree*. Recovery, compaction (re-parenting), branching, and future sub-agent sessions all fall out of one structure. The `Agent`'s in-RAM state is rebuilt from this log; a `resolute.SessionRepo` adapter projects the active leaf path into agent-core unchanged — see ADR-0003.
 - **HTTP transport** — `POST` = 202 admission, `GET` = SSE replay-from-offset then live tail, `?wait=true` blocking convenience, `POST …/steer` and `…/followup` for mid-run control — see ADR-0004.
 - **`user` vs `signal` inbound kinds** — direct exchanges vs. one participant's activity in a multi-party conversation (a Slack thread, a GitHub issue), in the record schema from day one — see ADR-0005.
 - **Structured results** — attach a JSON Schema to a prompt (`resultSchema`) and get validated JSON on the settled record, with corrective-turn retries.
