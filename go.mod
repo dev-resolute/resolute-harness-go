@@ -3,7 +3,7 @@ module github.com/dev-resolute/resolute-harness-go
 go 1.26.2
 
 require (
-	github.com/dev-resolute/resolute-agent-core-go v0.11.0
+	github.com/dev-resolute/resolute-agent-core-go v0.12.0
 	github.com/dev-resolute/resolute-llm-go v0.12.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
