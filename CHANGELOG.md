@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.1] - 2026-09-20
+
+### Changed
+
+- **`resolute-agent-core-go` v0.12.0 → v0.13.0, `resolute-llm-go` v0.12.0 →
+  v0.13.0.** Dependency bump only — no harness code changes. The upstream
+  0.84.2–0.86.0 port triage found no harness-side items: steer/follow-up
+  bypassing input handlers (#8718) presupposes pi's extension `input` hook,
+  which has no resolute equivalent (all injection paths route uniformly
+  through agent-core's prompt), `user_bash` is a pi-extension concept, and
+  session stores here already read metadata only (#9601). Consumers pick up
+  the per-model compaction budgets, truncated-summary guard, tool-schema
+  registration validation, and provider fixes through the bump.
+
 ## [0.6.0] - 2026-08-09
 
 > **Requires migration (SQLite):** the store schema moves to v3 — six new
