@@ -54,6 +54,10 @@ type AgentRuntimeConfig struct {
 	// failing a compaction outright. Retry lifecycle is surfaced to
 	// Observers as RecoveryEvents.
 	SummarizationRetry pi.SummarizationRetryPolicy
+	// Thinking is agent-core's DefaultThinking: the reasoning level sent on
+	// every LLMRequest. The zero value (llm.ThinkingOff) leaves the
+	// provider's non-thinking default in place.
+	Thinking llm.ThinkingLevel
 	// MaxAttempts is the durability budget on execution tries, recomputed
 	// from durable history on every claim; 0 means DefaultMaxAttempts.
 	MaxAttempts int

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.2] - 2026-09-20
+
+### Added
+
+- **`AgentRuntimeConfig.Thinking`.** The reasoning level forwarded to
+  agent-core as `DefaultThinking` and sent on every `LLMRequest` from both
+  the prompt engine and the `Compact` path. Previously the harness never set
+  it, so every request left as `llm.ThinkingOff` regardless of the model. The
+  zero value keeps that behaviour; agent-core still downgrades to off for a
+  provider whose `Capabilities` report no thinking support.
+
 ## [0.6.1] - 2026-09-20
 
 ### Changed
