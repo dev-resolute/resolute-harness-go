@@ -367,6 +367,7 @@ func (rt *Runtime) Compact(ctx context.Context, req CompactRequest) error {
 		ReserveTokens:      cfg.ReserveTokens,
 		KeepRecentTokens:   cfg.KeepRecentTokens,
 		SummarizationRetry: cfg.SummarizationRetry,
+		DefaultThinking:    cfg.Thinking,
 		Session: &projection{
 			store:        rt.store,
 			conv:         conv,

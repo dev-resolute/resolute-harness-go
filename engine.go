@@ -1097,6 +1097,7 @@ func (r *submissionRun) drive(ctx context.Context) error {
 		ReserveTokens:      r.cfg.ReserveTokens,
 		KeepRecentTokens:   r.cfg.KeepRecentTokens,
 		SummarizationRetry: r.cfg.SummarizationRetry,
+		DefaultThinking:    r.cfg.Thinking,
 		Session:            proj,
 		Hooks: pi.Hooks{
 			OnSummarizationRetry: summarizationRetryObserver(r.rt.observe, r.correlation()),
