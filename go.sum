@@ -16,10 +16,10 @@ github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGX
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dev-resolute/resolute-agent-core-go v0.13.0 h1:YjO0tYTJ6uLP6BEgYacta/ut5GFrk4AmvBU2V1smJCE=
-github.com/dev-resolute/resolute-agent-core-go v0.13.0/go.mod h1:XBMRZmV3lcFgzX0zAw7OJ4m7u1B0l/YgdTlBrLRZFN0=
-github.com/dev-resolute/resolute-llm-go v0.13.0 h1:SXuTvqHV5QuHLihfo7RI2Ol+PzliDZblPrTYL1GHe7U=
-github.com/dev-resolute/resolute-llm-go v0.13.0/go.mod h1:ZAHu8POe1yOfOzxUofah4nHfpx4MIgKOlnCK8LlC4LE=
+github.com/dev-resolute/resolute-agent-core-go v0.13.1 h1:4cC0nxPHj9rPYZuCkQ6bia5PxBw2onlrHw8UjG6v4zc=
+github.com/dev-resolute/resolute-agent-core-go v0.13.1/go.mod h1:aGD5Dmrj1BlB/vDtVkYDW5NU95Z/sq2+eePT9FViB80=
+github.com/dev-resolute/resolute-llm-go v0.14.0 h1:1MmW1hJVftnoJHlnMcknYEcbJ7l6aqFzQou5Sx+cJ+s=
+github.com/dev-resolute/resolute-llm-go v0.14.0/go.mod h1:ZAHu8POe1yOfOzxUofah4nHfpx4MIgKOlnCK8LlC4LE=
 github.com/dlclark/regexp2 v1.11.0 h1:G/nrcoOa7ZXlpoa/91N3X7mM3r8eIlMBBJZvsz/mxKI=
 github.com/dlclark/regexp2 v1.11.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

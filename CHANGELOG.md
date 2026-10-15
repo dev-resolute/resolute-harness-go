@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.3] - 2026-10-14
+
+### Changed
+
+- **agent-core v0.13.1 / llm-go v0.14.0.** Picks up Gemini 4 (argon)
+  support: `gemini/gemini-4-argon` now classifies correctly (thinkingLevel
+  enum, strict tool sampling, signed-replay tool-call IDs, vision).
+  Live-gate verified against argon (coder example, all three scenarios).
+
 ## [0.6.2] - 2026-09-20
 
 ### Added
